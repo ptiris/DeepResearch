@@ -90,6 +90,7 @@ class MetricsCollector:
         success: bool,
         latency_ms: float,
         effective_calls: int = 1,
+        status_code: Optional[int] = None,
     ) -> None:
         category = "search" if tool_name in self.SEARCH_TOOL_NAMES else "other"
         bucket = self._tool_stats.setdefault(tool_name, self._new_tool_bucket(category))
@@ -99,6 +100,10 @@ class MetricsCollector:
         bucket["success_calls"] += 1 if success else 0
         bucket["failed_calls"] += 0 if success else 1
         bucket["total_latency_ms"] += max(latency_ms, 0.0)
+        if status_code is not None:
+            if "status_codes" not in bucket:
+                bucket["status_codes"] = {}
+            bucket["status_codes"][status_code] = bucket["status_codes"].get(status_code, 0) + 1
 
     @staticmethod
     def infer_tool_success(result: Any) -> bool:
@@ -181,6 +186,7 @@ class MetricsCollector:
             "success_calls": 0,
             "failed_calls": 0,
             "total_latency_ms": 0.0,
+            "status_codes": {},
         }
 
     @staticmethod
@@ -261,7 +267,7 @@ class MetricsCollector:
         success_rate = (float(success_calls) / float(calls) * 100.0) if calls > 0 else 0.0
         avg_latency_ms = (total_latency_ms / float(calls)) if calls > 0 else 0.0
 
-        return {
+        result = {
             "category": bucket.get("category", "other"),
             "calls": calls,
             "effective_calls": int(bucket.get("effective_calls", 0)),
@@ -273,6 +279,12 @@ class MetricsCollector:
                 "average": round(avg_latency_ms, 4),
             },
         }
+
+        status_codes = bucket.get("status_codes", {})
+        if status_codes:
+            result["status_codes"] = status_codes
+
+        return result
 
     def _aggregate_tool_buckets(self, finalized_buckets: Dict[str, Dict[str, Any]], category: str) -> Dict[str, Any]:
         calls = sum(v.get("calls", 0) for v in finalized_buckets.values())

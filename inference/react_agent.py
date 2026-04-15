@@ -238,6 +238,7 @@ class MultiTurnReactAgent(FnCallAgent):
         tool_start = time.perf_counter()
         success = False
         effective_calls = 1
+        status_code = None
         if tool_name in TOOL_MAP:
             tool_args["params"] = tool_args
             if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
@@ -263,7 +264,10 @@ class MultiTurnReactAgent(FnCallAgent):
                         result = str(raw_result)
                 else:
                     raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
-                    result = raw_result
+                    if isinstance(raw_result, tuple) and len(raw_result) == 2:
+                        result, status_code = raw_result
+                    else:
+                        result = raw_result
                 success = MetricsCollector.infer_tool_success(result)
                 return result
             except Exception as e:
@@ -277,6 +281,7 @@ class MultiTurnReactAgent(FnCallAgent):
                         success=success,
                         latency_ms=(time.perf_counter() - tool_start) * 1000.0,
                         effective_calls=effective_calls,
+                        status_code=status_code,
                     )
         else:
             result = f"Error: Tool {tool_name} not found"
@@ -286,5 +291,6 @@ class MultiTurnReactAgent(FnCallAgent):
                     success=False,
                     latency_ms=(time.perf_counter() - tool_start) * 1000.0,
                     effective_calls=effective_calls,
+                    status_code=status_code,
                 )
             return result

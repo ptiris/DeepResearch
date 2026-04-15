@@ -62,9 +62,11 @@ class Search(BaseTool):
         if https_proxy:
             proxies['https'] = https_proxy
         print(f"Using proxies: {proxies}")
+        last_status_code = None
         for i in range(5):
             try:
                 res = requests.post("https://google.serper.dev/search", json=payload, headers=headers, proxies=proxies, timeout=30)
+                last_status_code = res.status_code
                 if res.status_code == 200:
                     results = res.json()
                     break
@@ -72,13 +74,13 @@ class Search(BaseTool):
                     print(f"HTTP {res.status_code}: {res.text}")
                     if i == 4:
                         print("5 Attempts for search have failed")
-                        return f"Google search failed with HTTP {res.status_code}, Please try again later."
+                        return f"Google search failed with HTTP {res.status_code}, Please try again later.", last_status_code
                     continue
             except Exception as e:
                 print(e)
                 if i == 4:
                     print("5 Attempts for search have failed")
-                    return f"Google search Timeout, return None, Please try again later."
+                    return f"Google search Timeout, return None, Please try again later.", None
                 continue
 
         try:
@@ -107,32 +109,35 @@ class Search(BaseTool):
                     web_snippets.append(redacted_version)
 
             content = f"A Google search for '{query}' found {len(web_snippets)} results:\n\n## Web Results\n" + "\n\n".join(web_snippets)
-            return content
+            return content, 200
         except:
-            return f"No results found for '{query}'. Try with a more general query."
+            return f"No results found for '{query}'. Try with a more general query.", None
 
 
     
     def search_with_serp(self, query: str):
-        result = self.google_search_with_serp(query)
-        return result
+        result, status_code = self.google_search_with_serp(query)
+        return result, status_code
 
-    def call(self, params: Union[str, dict], **kwargs) -> str:
+    def call(self, params: Union[str, dict], **kwargs) -> tuple:
         try:
             query = params["query"]
         except:
-            return "[Search] Invalid request format: Input must be a JSON object containing 'query' field"
+            return "[Search] Invalid request format: Input must be a JSON object containing 'query' field", None
         
         if isinstance(query, str):
-            # 单个查询
-            response = self.search_with_serp(query)
+            response, status_code = self.search_with_serp(query)
         else:
-            # 多个查询
             assert isinstance(query, List)
             responses = []
+            status_codes = []
             for q in query:
-                responses.append(self.search_with_serp(q))
+                resp, sc = self.search_with_serp(q)
+                responses.append(resp)
+                if sc is not None:
+                    status_codes.append(sc)
             response = "\n=======\n".join(responses)
+            status_code = status_codes[0] if status_codes else (status_codes[-1] if status_codes else None)
             
-        return response
+        return response, status_code
 

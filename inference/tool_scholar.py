@@ -41,21 +41,23 @@ class Scholar(BaseTool):
             proxies['http'] = http_proxy
         if https_proxy:
             proxies['https'] = https_proxy
+        last_status_code = None
         for i in range(5):
             try:
                 res = requests.post("https://google.serper.dev/scholar", json=payload, headers=headers, proxies=proxies, timeout=30)
+                last_status_code = res.status_code
                 if res.status_code == 200:
                     results = res.json()
                     break
                 else:
                     print(f"HTTP {res.status_code}: {res.text}")
                     if i == 4:
-                        return f"Google Scholar failed with HTTP {res.status_code}, Please try again later."
+                        return f"Google Scholar failed with HTTP {res.status_code}, Please try again later.", last_status_code
                     continue
             except Exception as e:
                 print(e)
                 if i == 4:
-                    return f"Google Scholar Timeout, return None, Please try again later."
+                    return f"Google Scholar Timeout, return None, Please try again later.", None
                 continue
         try:
             if "organic" not in results:
@@ -92,25 +94,26 @@ class Scholar(BaseTool):
                     web_snippets.append(redacted_version)
 
             content = f"A Google scholar for '{query}' found {len(web_snippets)} results:\n\n## Scholar Results\n" + "\n\n".join(web_snippets)
-            return content
+            return content, 200
         except:
-            return f"No results found for '{query}'. Try with a more general query."
+            return f"No results found for '{query}'. Try with a more general query.", None
 
 
-    def call(self, params: Union[str, dict], **kwargs) -> str:
-        # assert GOOGLE_SEARCH_KEY is not None, "Please set the IDEALAB_SEARCH_KEY environment variable."
+    def call(self, params: Union[str, dict], **kwargs) -> tuple:
         try:
             params = self._verify_json_format_args(params)
             query = params["query"]
         except:
-            return "[google_scholar] Invalid request format: Input must be a JSON object containing 'query' field"
+            return "[google_scholar] Invalid request format: Input must be a JSON object containing 'query' field", None
         
         if isinstance(query, str):
-            response = self.google_scholar_with_serp(query)
+            response, status_code = self.google_scholar_with_serp(query)
         else:
             assert isinstance(query, List)
             with ThreadPoolExecutor(max_workers=3) as executor:
-
-                response = list(executor.map(self.google_scholar_with_serp, query))
-            response = "\n=======\n".join(response)
-        return response
+                results = list(executor.map(self.google_scholar_with_serp, query))
+            responses = [r[0] for r in results]
+            status_codes = [r[1] for r in results if r[1] is not None]
+            response = "\n=======\n".join(responses)
+            status_code = status_codes[0] if status_codes else (status_codes[-1] if status_codes else None)
+        return response, status_code
