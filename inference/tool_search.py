@@ -6,9 +6,6 @@ from qwen_agent.tools.base import BaseTool, register_tool
 import asyncio
 from typing import Dict, List, Optional, Union
 import uuid
-import http.client
-import json
-
 import os
 
 
@@ -38,41 +35,51 @@ class Search(BaseTool):
     def google_search_with_serp(self, query: str):
         def contains_chinese_basic(text: str) -> bool:
             return any('\u4E00' <= char <= '\u9FFF' for char in text)
-        conn = http.client.HTTPSConnection("google.serper.dev")
         if contains_chinese_basic(query):
-            payload = json.dumps({
+            payload = {
                 "q": query,
                 "location": "China",
                 "gl": "cn",
                 "hl": "zh-cn"
-            })
-            
+            }
         else:
-            payload = json.dumps({
+            payload = {
                 "q": query,
                 "location": "United States",
                 "gl": "us",
                 "hl": "en"
-            })
+            }
         headers = {
                 'X-API-KEY': SERPER_KEY,
                 'Content-Type': 'application/json'
-            }
-        
-        
+                }
+        print("Search Payloads: ", json.dumps(payload))
+        proxies = {}
+        http_proxy = os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
+        https_proxy = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
+        if http_proxy:
+            proxies['http'] = http_proxy
+        if https_proxy:
+            proxies['https'] = https_proxy
+        print(f"Using proxies: {proxies}")
         for i in range(5):
             try:
-                conn.request("POST", "/search", payload, headers)
-                res = conn.getresponse()
-                break
+                res = requests.post("https://google.serper.dev/search", json=payload, headers=headers, proxies=proxies, timeout=30)
+                if res.status_code == 200:
+                    results = res.json()
+                    break
+                else:
+                    print(f"HTTP {res.status_code}: {res.text}")
+                    if i == 4:
+                        print("5 Attempts for search have failed")
+                        return f"Google search failed with HTTP {res.status_code}, Please try again later."
+                    continue
             except Exception as e:
                 print(e)
                 if i == 4:
+                    print("5 Attempts for search have failed")
                     return f"Google search Timeout, return None, Please try again later."
                 continue
-    
-        data = res.read()
-        results = json.loads(data.decode("utf-8"))
 
         try:
             if "organic" not in results:
