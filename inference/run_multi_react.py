@@ -12,7 +12,6 @@ import math
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="")
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--dataset", type=str, default="gaia")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -24,20 +23,17 @@ if __name__ == "__main__":
     parser.add_argument("--worker_split", type=int, default=1)
     args = parser.parse_args()
 
-    model = args.model
     output_base = args.output
     roll_out_count = args.roll_out_count
     total_splits = args.total_splits
     worker_split = args.worker_split
 
-    # Validate worker_split
     if worker_split < 1 or worker_split > total_splits:
         print(f"Error: worker_split ({worker_split}) must be between 1 and total_splits ({total_splits})")
         exit(1)
 
-    model_name = os.path.basename(model.rstrip('/'))
-
-    model_dir = os.path.join(output_base, f"{model_name}_sglang")
+    model_name = os.getenv("OPENROUTER_MODEL", "openrouter_model")
+    model_dir = os.path.join(output_base, model_name)
     dataset_dir = os.path.join(model_dir, args.dataset)
 
     os.makedirs(dataset_dir, exist_ok=True)
@@ -62,7 +58,6 @@ if __name__ == "__main__":
                 items = [json.loads(line) for line in f]
         else:
             raise ValueError("Unsupported file extension. Please use .json or .jsonl files.")
-        items = items
     except FileNotFoundError:
         print(f"Error: Input file not found at {data_filepath}")
         exit(1)
@@ -70,20 +65,17 @@ if __name__ == "__main__":
         print(f"Error reading or parsing input file {data_filepath}: {e}")
         exit(1)
 
-    # Apply data splitting
     total_items = len(items)
     items_per_split = math.ceil(total_items / total_splits)
     start_idx = (worker_split - 1) * items_per_split
     end_idx = min(worker_split * items_per_split, total_items)
 
-    # Split the dataset
     items = items[start_idx:end_idx]
 
     print(f"Total items in dataset: {total_items}")
     print(f"Processing items {start_idx} to {end_idx-1} ({len(items)} items)")
 
     if total_splits > 1:
-        # Add split suffix to output files when using splits
         output_files = {i: os.path.join(dataset_dir, f"iter{i}_split{worker_split}of{total_splits}.jsonl") for i in range(1, roll_out_count + 1)}
     else:
         output_files = {i: os.path.join(dataset_dir, f"iter{i}.jsonl") for i in range(1, roll_out_count + 1)}
@@ -109,13 +101,7 @@ if __name__ == "__main__":
 
     tasks_to_run_all = []
     per_rollout_task_counts = {i: 0 for i in range(1, roll_out_count + 1)}
-    # Define ports
-    planning_ports = [6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008]
-    # Round-robin state
-    planning_rr_idx = 0
-    summary_rr_idx = 0
-    # Sticky assignment per question
-    question_to_ports = {}
+
     for rollout_idx in range(1, roll_out_count + 1):
         processed_queries = processed_queries_per_rollout[rollout_idx]
         for item in items:
@@ -132,16 +118,9 @@ if __name__ == "__main__":
                 continue
 
             if question not in processed_queries:
-                # Ensure sticky and balanced port assignment per unique question
-                if question not in question_to_ports:
-                    planning_port = planning_ports[planning_rr_idx % len(planning_ports)]
-                    question_to_ports[question] = planning_port
-                    planning_rr_idx += 1
-                planning_port = question_to_ports[question]
                 tasks_to_run_all.append({
                     "item": item.copy(),
                     "rollout_idx": rollout_idx,
-                    "planning_port": planning_port,
                 })
                 per_rollout_task_counts[rollout_idx] += 1
 
@@ -153,15 +132,12 @@ if __name__ == "__main__":
         print("All rollouts have been completed and no execution is required.")
     else:
         llm_cfg = {
-            'model': model,
             'generate_cfg': {
-                'max_input_tokens': 320000,
                 'max_retries': 10,
                 'temperature': args.temperature,
                 'top_p': args.top_p,
                 'presence_penalty': args.presence_penalty
-            },
-            'model_type': 'qwen_dashscope'
+            }
         }
 
         test_agent = MultiTurnReactAgent(
@@ -176,11 +152,11 @@ if __name__ == "__main__":
                 executor.submit(
                     test_agent._run,
                     task,
-                    model
+                    model_name
                 ): task for task in tasks_to_run_all
             }
 
-            for future in tqdm(as_completed(future_to_task), total=len(tasks_to_run_all), desc="Processing All Rollouts"):
+            for future in tqdm(as_completed(future_to_task), total=len(future_to_task), desc="Processing All Rollouts"):
                 task_info = future_to_task[future]
                 rollout_idx = task_info["rollout_idx"]
                 output_file = output_files[rollout_idx]
