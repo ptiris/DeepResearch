@@ -25,4 +25,4 @@ echo "Starting inference..."
 
 cd "$( dirname -- "${BASH_SOURCE[0]}" )"
 
-python -u run_multi_react.py --dataset "$DATASET" --output "$OUTPUT_PATH" --max_workers $MAX_WORKERS --temperature $TEMPERATURE --presence_penalty $PRESENCE_PENALTY --total_splits ${WORLD_SIZE:-1} --worker_split $((${RANK:-0} + 1)) --roll_out_count $ROLLOUT_COUNT
+python -u run_multi_react.py --dataset "$DATASET" --data_file "$DATA_FILE" --output "$OUTPUT_PATH" --max_workers $MAX_WORKERS --temperature $TEMPERATURE --presence_penalty $PRESENCE_PENALTY --total_splits ${WORLD_SIZE:-1} --worker_split $((${RANK:-0} + 1)) --roll_out_count $ROLLOUT_COUNT

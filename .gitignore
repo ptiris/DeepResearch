@@ -149,3 +149,7 @@ cache/
 models/
 outputs/
 checkpoints/
+
+# data and outputs
+data/
+output/

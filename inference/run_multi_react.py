@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--dataset", type=str, default="gaia")
+    parser.add_argument("--data_file", type=str, default="")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--presence_penalty", type=float, default=1.1)
@@ -38,13 +39,13 @@ if __name__ == "__main__":
 
     os.makedirs(dataset_dir, exist_ok=True)
 
+    data_filepath = args.data_file if args.data_file else args.dataset
+
     print(f"Model name: {model_name}")
-    print(f"Data set path: {args.dataset}")
+    print(f"Input data file: {data_filepath}")
     print(f"Output directory: {dataset_dir}")
     print(f"Number of rollouts: {roll_out_count}")
     print(f"Data splitting: {worker_split}/{total_splits}")
-
-    data_filepath = f"{args.dataset}"
     try:
         if data_filepath.endswith(".json"):
             with open(data_filepath, "r", encoding="utf-8") as f:
@@ -141,7 +142,7 @@ if __name__ == "__main__":
         }
 
         test_agent = MultiTurnReactAgent(
-            llm=llm_cfg,
+            llm_cfg=llm_cfg,
             function_list=["search", "visit", "google_scholar", "PythonInterpreter"]
         )
 

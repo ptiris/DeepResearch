@@ -3,7 +3,7 @@ import json5
 import os
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
-from qwen_agent.utils.util import build_text_completion_prompt
+from qwen_agent.utils.utils import build_text_completion_prompt
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
 from datetime import datetime
 from qwen_agent.agents.fncall_agent import FnCallAgent
@@ -43,12 +43,16 @@ def today_date():
     return datetime.date.today().strftime("%Y-%m-%d")
 
 
+class DummyLLM:
+    model = "dummy"
+
 class MultiTurnReactAgent(FnCallAgent):
     def __init__(
         self,
-        function_list: Optional[Union[List[Union[str, Dict, BaseTool]]]]) -> None:
-        super().__init__(function_list)
-        self.llm_generate_cfg = {}
+        function_list: Optional[Union[List[Union[str, Dict, BaseTool]]]],
+        llm_cfg: Optional[Dict] = None) -> None:
+        super().__init__(llm=DummyLLM(), function_list=function_list)
+        self.llm_generate_cfg = llm_cfg.get("generate_cfg", {}) if llm_cfg else {}
 
     def call_server(self, msgs, max_tries=10):
         openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
