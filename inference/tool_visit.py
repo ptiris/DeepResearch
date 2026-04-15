@@ -3,7 +3,7 @@ import os
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Union
+from typing import List, Optional, Union
 import requests
 from qwen_agent.tools.base import BaseTool, register_tool
 from prompt import EXTRACTOR_PROMPT 
@@ -13,6 +13,7 @@ from urllib.parse import urlparse, unquote
 import time 
 from transformers import AutoTokenizer
 import tiktoken
+from metrics import MetricsCollector
 
 VISIT_SERVER_TIMEOUT = int(os.getenv("VISIT_SERVER_TIMEOUT", 200))
 WEBCONTENT_MAXLENGTH = int(os.getenv("WEBCONTENT_MAXLENGTH", 150000))
@@ -68,6 +69,8 @@ class Visit(BaseTool):
         except:
             return "[Visit] Invalid request format: Input must be a JSON object containing 'url' and 'goal' fields"
 
+        metrics = kwargs.get("_metrics")
+
         start_time = time.time()
         
         # Create log folder if it doesn't exist
@@ -75,7 +78,7 @@ class Visit(BaseTool):
         os.makedirs(log_folder, exist_ok=True)
 
         if isinstance(url, str):
-            response = self.readpage_jina(url, goal)
+            response = self.readpage_jina(url, goal, _metrics=metrics)
         else:
             response = []
             assert isinstance(url, List)
@@ -87,7 +90,7 @@ class Visit(BaseTool):
                     cur_response += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
                 else:
                     try:
-                        cur_response = self.readpage_jina(u, goal)
+                        cur_response = self.readpage_jina(u, goal, _metrics=metrics)
                     except Exception as e:
                         cur_response = f"Error fetching {u}: {str(e)}"
                 response.append(cur_response)
@@ -96,7 +99,7 @@ class Visit(BaseTool):
         print(f'Summary Length {len(response)}; Summary Content {response}')
         return response.strip()
         
-    def call_server(self, msgs, max_retries=2):
+    def call_server(self, msgs, max_retries=2, _metrics: Optional[MetricsCollector] = None):
         api_key = os.environ.get("API_KEY")
         url_llm = os.environ.get("API_BASE")
         model_name = os.environ.get("SUMMARY_MODEL_NAME", "")
@@ -105,6 +108,7 @@ class Visit(BaseTool):
             base_url=url_llm,
         )
         for attempt in range(max_retries):
+            call_start = time.perf_counter()
             try:
                 chat_response = client.chat.completions.create(
                     model=model_name,
@@ -112,6 +116,8 @@ class Visit(BaseTool):
                     temperature=0.7
                 )
                 content = chat_response.choices[0].message.content
+                usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
+                latency_ms = (time.perf_counter() - call_start) * 1000.0
                 if content:
                     try:
                         json.loads(content)
@@ -121,9 +127,40 @@ class Visit(BaseTool):
                         right = content.rfind('}') 
                         if left != -1 and right != -1 and left <= right: 
                             content = content[left:right+1]
+                    if _metrics:
+                        _metrics.record_model_call(
+                            model_group="summary_model",
+                            success=True,
+                            latency_ms=latency_ms,
+                            usage=usage,
+                        )
+                        _metrics.record_prompt_breakdown(
+                            model_group="summary_model",
+                            messages=msgs,
+                            usage=usage,
+                        )
                     return content
+                if _metrics:
+                    _metrics.record_model_call(
+                        model_group="summary_model",
+                        success=False,
+                        latency_ms=latency_ms,
+                        usage=usage,
+                    )
+                    _metrics.record_prompt_breakdown(
+                        model_group="summary_model",
+                        messages=msgs,
+                        usage=usage,
+                    )
             except Exception as e:
                 # print(e)
+                if _metrics:
+                    _metrics.record_model_call(
+                        model_group="summary_model",
+                        success=False,
+                        latency_ms=(time.perf_counter() - call_start) * 1000.0,
+                        usage=None,
+                    )
                 if attempt == (max_retries - 1):
                     return ""
                 continue
@@ -176,7 +213,7 @@ class Visit(BaseTool):
                 return content
         return "[visit] Failed to read page."
 
-    def readpage_jina(self, url: str, goal: str) -> str:
+    def readpage_jina(self, url: str, goal: str, _metrics: Optional[MetricsCollector] = None) -> str:
         """
         Attempt to read webpage content by alternating between jina and aidata services.
         
@@ -197,7 +234,7 @@ class Visit(BaseTool):
             content = truncate_to_tokens(content, max_tokens=95000)
             messages = [{"role":"user","content": EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal)}]
             parse_retry_times = 0
-            raw = summary_page_func(messages, max_retries=max_retries)
+            raw = summary_page_func(messages, max_retries=max_retries, _metrics=_metrics)
             summary_retries = 3
             while len(raw) < 10 and summary_retries >= 0:
                 truncate_length = int(0.7 * len(content)) if summary_retries > 0 else 25000
@@ -217,7 +254,7 @@ class Visit(BaseTool):
                     goal=goal
                 )
                 messages = [{"role": "user", "content": extraction_prompt}]
-                raw = summary_page_func(messages, max_retries=max_retries)
+                raw = summary_page_func(messages, max_retries=max_retries, _metrics=_metrics)
                 summary_retries -= 1
 
             parse_retry_times = 0
@@ -228,7 +265,7 @@ class Visit(BaseTool):
                     raw = json.loads(raw)
                     break
                 except:
-                    raw = summary_page_func(messages, max_retries=max_retries)
+                    raw = summary_page_func(messages, max_retries=max_retries, _metrics=_metrics)
                     parse_retry_times += 1
             
             if parse_retry_times >= 3:

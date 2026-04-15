@@ -109,7 +109,7 @@ class FileParser(BaseTool):
         }
     ]
 
-    async def call(self, params, file_root_path):
+    async def call(self, params, file_root_path, **kwargs):
         file_name = params["files"]
         outputs = []
         

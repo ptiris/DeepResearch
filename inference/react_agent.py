@@ -15,6 +15,7 @@ from qwen_agent.utils.utils import format_as_text_message, merge_generate_cfgs
 from prompt import *
 import time
 import asyncio
+from metrics import MetricsCollector
 
 from tool_file import *
 from tool_scholar import *
@@ -54,7 +55,7 @@ class MultiTurnReactAgent(FnCallAgent):
         super().__init__(llm=DummyLLM(), function_list=function_list)
         self.llm_generate_cfg = llm_cfg.get("generate_cfg", {}) if llm_cfg else {}
 
-    def call_server(self, msgs, max_tries=10):
+    def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
         openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
         openai_api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
         model = os.getenv("OPENROUTER_MODEL", "")
@@ -70,6 +71,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
         base_sleep_time = 1
         for attempt in range(max_tries):
+            call_start = time.perf_counter()
             try:
                 print(f"--- Attempting to call OpenRouter, try {attempt + 1}/{max_tries} ---")
                 chat_response = client.chat.completions.create(
@@ -82,17 +84,60 @@ class MultiTurnReactAgent(FnCallAgent):
                     presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
                 )
                 content = chat_response.choices[0].message.content
+                usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
+                latency_ms = (time.perf_counter() - call_start) * 1000.0
 
                 if content and content.strip():
                     print("--- OpenRouter call successful, received a valid response ---")
-                    return content.strip()
+                    if metrics:
+                        metrics.record_model_call(
+                            model_group="research_model",
+                            success=True,
+                            latency_ms=latency_ms,
+                            usage=usage,
+                        )
+                        metrics.record_prompt_breakdown(
+                            model_group="research_model",
+                            messages=msgs,
+                            usage=usage,
+                        )
+                    return {
+                        "content": content.strip(),
+                        "usage": usage,
+                    }
                 else:
                     print(f"Warning: Attempt {attempt + 1} received an empty response.")
+                    if metrics:
+                        metrics.record_model_call(
+                            model_group="research_model",
+                            success=False,
+                            latency_ms=latency_ms,
+                            usage=usage,
+                        )
+                        metrics.record_prompt_breakdown(
+                            model_group="research_model",
+                            messages=msgs,
+                            usage=usage,
+                        )
 
             except (APIError, APIConnectionError, APITimeoutError) as e:
                 print(f"Error: Attempt {attempt + 1} failed with an API or network error: {e}")
+                if metrics:
+                    metrics.record_model_call(
+                        model_group="research_model",
+                        success=False,
+                        latency_ms=(time.perf_counter() - call_start) * 1000.0,
+                        usage=None,
+                    )
             except Exception as e:
                 print(f"Error: Attempt {attempt + 1} failed with an unexpected error: {e}")
+                if metrics:
+                    metrics.record_model_call(
+                        model_group="research_model",
+                        success=False,
+                        latency_ms=(time.perf_counter() - call_start) * 1000.0,
+                        usage=None,
+                    )
 
             if attempt < max_tries - 1:
                 sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
@@ -103,9 +148,13 @@ class MultiTurnReactAgent(FnCallAgent):
             else:
                 print("Error: All retry attempts have been exhausted. The call has failed.")
 
-        return "openrouter error!!!"
+        return {
+            "content": "openrouter error!!!",
+            "usage": None,
+        }
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
+        metrics = MetricsCollector()
         try:
             question = data['item']['question']
         except:
@@ -135,7 +184,8 @@ class MultiTurnReactAgent(FnCallAgent):
                 return result
             round += 1
             num_llm_calls_available -= 1
-            content = self.call_server(messages)
+            model_response = self.call_server(messages, metrics=metrics)
+            content = model_response.get("content", "")
             print(f'Round {round}: {content}')
             if '<tool_response>' in content:
                 pos = content.find('<tool_response>')
@@ -154,7 +204,7 @@ class MultiTurnReactAgent(FnCallAgent):
                         tool_call = json5.loads(tool_call)
                         tool_name = tool_call.get('name', '')
                         tool_args = tool_call.get('arguments', {})
-                        result = self.custom_call_tool(tool_name, tool_args)
+                        result = self.custom_call_tool(tool_name, tool_args, _metrics=metrics)
                 except:
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
                 result = "<tool_response>\n" + result + "\n</tool_response>"
@@ -178,24 +228,63 @@ class MultiTurnReactAgent(FnCallAgent):
             "answer": answer,
             "messages": messages,
             "prediction": prediction,
-            "termination": termination
+            "termination": termination,
+            "metrics": metrics.to_dict(),
         }
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
+        metrics: Optional[MetricsCollector] = kwargs.get("_metrics")
+        tool_start = time.perf_counter()
+        success = False
+        effective_calls = 1
         if tool_name in TOOL_MAP:
             tool_args["params"] = tool_args
-            if "python" in tool_name.lower():
-                result = TOOL_MAP['PythonInterpreter'].call(tool_args)
-            elif tool_name == "parse_file":
-                params = {"files": tool_args["files"]}
-                raw_result = asyncio.run(TOOL_MAP[tool_name].call(params, file_root_path="./eval_data/file_corpus"))
-                result = raw_result
-                if not isinstance(raw_result, str):
-                    result = str(raw_result)
-            else:
-                raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
-                result = raw_result
-            return result
+            if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
+                query = tool_args.get("query", [])
+                if isinstance(query, list):
+                    effective_calls = len(query)
+                elif isinstance(query, str):
+                    effective_calls = 1
+            try:
+                if "python" in tool_name.lower():
+                    result = TOOL_MAP['PythonInterpreter'].call(tool_args)
+                elif tool_name == "parse_file":
+                    params = {"files": tool_args["files"]}
+                    raw_result = asyncio.run(
+                        TOOL_MAP[tool_name].call(
+                            params,
+                            file_root_path="./eval_data/file_corpus",
+                            **kwargs,
+                        )
+                    )
+                    result = raw_result
+                    if not isinstance(raw_result, str):
+                        result = str(raw_result)
+                else:
+                    raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
+                    result = raw_result
+                success = MetricsCollector.infer_tool_success(result)
+                return result
+            except Exception as e:
+                result = f"Error: Tool {tool_name} failed with exception: {str(e)}"
+                success = False
+                return result
+            finally:
+                if metrics:
+                    metrics.record_tool_call(
+                        tool_name=tool_name,
+                        success=success,
+                        latency_ms=(time.perf_counter() - tool_start) * 1000.0,
+                        effective_calls=effective_calls,
+                    )
         else:
-            return f"Error: Tool {tool_name} not found"
+            result = f"Error: Tool {tool_name} not found"
+            if metrics:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    success=False,
+                    latency_ms=(time.perf_counter() - tool_start) * 1000.0,
+                    effective_calls=effective_calls,
+                )
+            return result
