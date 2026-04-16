@@ -153,3 +153,7 @@ checkpoints/
 # data and outputs
 data/
 output/
+
+# soft links
+example_calc.py
+example_pricing.py

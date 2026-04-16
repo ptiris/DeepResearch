@@ -60,10 +60,15 @@ class MultiTurnReactAgent(FnCallAgent):
         self._function_list = function_list if function_list else []
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
-        openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
-        openai_api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-        model = os.getenv("OPENROUTER_MODEL", "")
-
+        provider = os.getenv('PROVIDER')
+        if (provider == 'openroute'):
+            openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
+            openai_api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+            model = os.getenv("OPENROUTER_MODEL", "")
+        elif(provider == 'dashscope'):
+            openai_api_key = os.getenv("DASHSCOPE_API_KEY", "")
+            openai_api_base = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
+            model = os.getenv("DASHSCOPE_MODEL", "")
         if not openai_api_key:
             return "Error: OPENROUTER_API_KEY not set in environment"
 
@@ -77,7 +82,7 @@ class MultiTurnReactAgent(FnCallAgent):
         for attempt in range(max_tries):
             call_start = time.perf_counter()
             try:
-                print(f"--- Attempting to call OpenRouter, try {attempt + 1}/{max_tries} ---")
+                print(f"--- Attempting to call {model}, try {attempt + 1}/{max_tries} ---")
                 chat_response = client.chat.completions.create(
                     model=model,
                     messages=msgs,
@@ -92,7 +97,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 latency_ms = (time.perf_counter() - call_start) * 1000.0
 
                 if content and content.strip():
-                    print("--- OpenRouter call successful, received a valid response ---")
+                    print(f"--- {provider} call successful, received a valid response ---")
                     if metrics:
                         metrics.record_model_call(
                             model_group="research_model",
@@ -153,7 +158,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 print("Error: All retry attempts have been exhausted. The call has failed.")
 
         return {
-            "content": "openrouter error!!!",
+            f"content": "{privider} error!!!",
             "usage": None,
         }
 

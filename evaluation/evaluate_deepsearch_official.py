@@ -18,9 +18,10 @@ import threading
 thread_local = threading.local()
 
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY","")
-os.environ['OPENAI_API_BASE'] = os.getenv("OPENAI_API_BASE","") 
+os.environ['OPENAI_API_BASE'] = os.getenv("OPENAI_API_BASE","")
 API_KEY= os.getenv("API_KEY","")
 BASE_URL=os.getenv("BASE_URL","")
+DASHSCOPE_API_KEY=os.getenv("DASHSCOPE_API_KEY","")
 
 def get_client():
     if not hasattr(thread_local, 'client'):
@@ -70,11 +71,18 @@ extracted_answer_format_for_xbench = {
 
 
 def is_correct_judgement(judgement):
-    return judgement.lower() == "correct" or (judgement and judgement.lower()[0] == "a")
+    if not judgement:
+        return False
+    judgement_lower = judgement.lower().strip()
+    if judgement_lower == "correct" or (judgement and judgement_lower[0] == "a"):
+        return True
+    if "correct: yes" in judgement_lower or '"correct": "yes"' in judgement_lower:
+        return True
+    return False
 
 
 def call_llm_judge(item): 
-    global judge_prompt, dataset, judge_model
+    global judge_prompt, judge_model
     
     question = item["question"]
     correct_answer = item["answer"]
@@ -83,7 +91,22 @@ def call_llm_judge(item):
     
     for attempt in range(100):
         try: 
-            if judge_model == "openai/qwen2.5-72b-instruct":
+            if 'dashscope' in judge_model or '/' in judge_model:
+                api_key = DASHSCOPE_API_KEY or os.getenv("DASHSCOPE_API_KEY","")
+                os.environ["DASHSCOPE_API_KEY"] = api_key
+                if '/' in judge_model:
+                    judge_model_with_provider = judge_model
+                else:
+                    judge_model_with_provider = f"dashscope/{judge_model}"
+                response = litellm.completion(
+                    model=judge_model_with_provider,
+                    messages=[{"role": "user", "content": prompt}],
+                    api_key=api_key,
+                    api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    num_retries=5
+                )
+                judgement = response.choices[0].message["content"]
+            elif judge_model == "openai/qwen2.5-72b-instruct":
                 response = litellm.completion(
                     model=judge_model,
                     messages=[{"role": "user", "content": prompt}],
@@ -104,19 +127,6 @@ def call_llm_judge(item):
                 raw_judge = json.loads(response_obj.choices[0].message.content)
                 judgement = "Correct" if raw_judge["结论"].lower() == "正确" else ""
 
-            elif 'browsecomp' in dataset:
-                os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY","")
-                response = litellm.completion(
-                    model=judge_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    num_retries=5,
-                    response_format=extracted_answer_format_for_confidence
-                )
-                
-                raw_content = response.choices[0].message["content"]
-                raw_judge = json.loads(raw_content)
-                judgement = "Correct" if raw_judge["correct"].lower() == "yes" else ""
-                
             else:
                 response = litellm.completion(
                     model=judge_model,
@@ -326,7 +336,6 @@ def single_round_statistics(input_file):
 
 
 def calculate_enhanced_statistics(round_results, round_items):
-    
     try:
         tokenizer = AutoTokenizer.from_pretrained(os.getenv("Qwen2_5_7B_PATH", ""))
     except Exception as e: 
@@ -336,7 +345,7 @@ def calculate_enhanced_statistics(round_results, round_items):
     correct_tool_calls = []
     correct_assistant_tokens = []
     
-    for round_name in ["round1", "round2", "round3"]:
+    for round_name in round_results.keys():
         results = round_results[round_name]
         items = round_items[round_name]
 
@@ -379,20 +388,16 @@ def calculate_enhanced_statistics(round_results, round_items):
     }
         
         
-def aggregate_results(round1_results, round2_results, round3_results): 
-    global dataset 
-    query_results = {} 
+def aggregate_results(*rounds_results):
+    query_results = {}
+    round_names = [f"round{i+1}" for i in range(len(rounds_results))]
     
-    for results, round_name in zip([round1_results, round2_results, round3_results], ["round1", "round2", "round3"]): 
-        for result in results: 
-            query = result["question"] 
-            if query not in query_results:  
-                query_results[query] = {
-                    "round1": None, 
-                    "round2": None,  
-                    "round3": None, 
-                    "answer": result["answer"]
-                }
+    for results, round_name in zip(rounds_results, round_names):
+        for result in results:
+            query = result["question"]
+            if query not in query_results:
+                query_results[query] = {rn: None for rn in round_names}
+                query_results[query]["answer"] = result["answer"]
             
             if is_correct_judgement(result["judgement"]):
                 query_results[query][round_name] = "Correct"
@@ -403,10 +408,15 @@ def aggregate_results(round1_results, round2_results, round3_results):
 
 
 def calculate_pass_at_k(query_results, k=10): 
+    if not query_results:
+        return 0.0
+    first_query = next(iter(query_results.values()))
+    round_names = [k for k in first_query.keys() if k != "answer"]
+    
     total_correct = 0 
 
     for query, results in query_results.items():
-        rounds = [results["round1"], results["round2"], results["round3"]][:k] 
+        rounds = [results.get(rn) for rn in round_names[:k]]
 
         if "Correct" in rounds: 
             total_correct += 1 
@@ -416,77 +426,79 @@ def calculate_pass_at_k(query_results, k=10):
 
 
 def calculate_best_pass_at_1(query_results):  
-    round_correct = {round_name: 0 for round_name in ["round1", "round2", "round3"]}
+    if not query_results:
+        return 0.0
+    first_query = next(iter(query_results.values()))
+    round_names = [k for k in first_query.keys() if k != "answer"]
+    
+    round_correct = {round_name: 0 for round_name in round_names}
 
     for query, results in query_results.items():
-        for round_name in ["round1", "round2", "round3"]: 
-            if results[round_name] == "Correct":  
+        for round_name in round_names: 
+            if results.get(round_name) == "Correct":  
                 round_correct[round_name] += 1 
 
+    if not round_correct:
+        return 0.0
     overall_best = max(
         round_correct[round_name] / len(query_results)
-        for round_name in ["round1", "round2", "round3"]
+        for round_name in round_names
     )
 
     return round(overall_best * 100, 2)
 
 
 def calculate_avg_pass_at_3(query_results): 
-    round_names = ["round1", "round2", "round3"]
+    if not query_results:
+        return 0.0
+    first_query = next(iter(query_results.values()))
+    round_names = [k for k in first_query.keys() if k != "answer"]
+    
     total_correct = {round_name: 0 for round_name in round_names}
 
     for query, results in query_results.items():  
         for round_name in round_names:  
-            if results[round_name] == "Correct":
+            if results.get(round_name) == "Correct":
                 total_correct[round_name] += 1 
     
+    if not round_names:
+        return 0.0
     avg_overall = sum(total_correct[r] / len(query_results) for r in round_names) / len(round_names)
     
     return round(avg_overall * 100, 2)
 
 
 def main():
-    global judge_prompt, dataset, judge_model
+    global judge_prompt, judge_model
     parser = argparse.ArgumentParser(description="Evaluate model predictions across multiple rounds")
     parser.add_argument("--input_folder", help="Path to prediction files")
     parser.add_argument("--restore_result_path",default='summary.jsonl', help="record result")
-    parser.add_argument("--dataset", type=str, default="browsecomp_en", choices=["gaia", 
-                                                                        "browsecomp_zh",
-                                                                        "browsecomp_en_full", 
-                                                                        "webwalker", 
-                                                                        "xbench-deepsearch",
-                                                                        ])
+    parser.add_argument("--num_rounds", type=int, default=1, help="Number of rounds (1-3)")
+    parser.add_argument("--judge_model", type=str, required=True, help="Judge model (e.g., qwen/qwen-3.5-plus)")
+    parser.add_argument("--judge_prompt", type=str, default="gaia", choices=["gaia", "xbench", "browsecomp"], help="Judge prompt type")
     args = parser.parse_args()
-    
-    dataset = args.dataset  
-    if dataset in ["gaia", "webwalker"]: 
-        judge_model = "openai/qwen2.5-72b-instruct"
-        judge_prompt = JUDGE_PROMPT_GAIA 
-    elif dataset in ["xbench-deepsearch"]: 
-        judge_prompt = JUDGE_PROMPT_XBENCH
-        judge_model = "google/gemini-2.0-flash-001"
-    elif dataset.startswith("browsecomp_zh"):
-        judge_model = "gpt-4o-2024-08-06"
-        judge_prompt = JUDGE_PROMPT_BROWSECOMP_OFFICIAL 
-    elif dataset.startswith("browsecomp_en"):
-        judge_model = "gpt-4o-2024-08-06"
-        judge_prompt = JUDGE_PROMPT_BROWSECOMP_OFFICIAL
-    else:
-        judge_model = "openai/qwen2.5-72b-instruct"
-        judge_prompt = JUDGE_PROMPT_GAIA 
-    print(f"Using {dataset} judge prompt ...")
-    print(f"Judge prompt:\n {judge_prompt}")
-    print(f"Judge model:\n {judge_model}")
 
-    round1_file, round2_file, round3_file = os.path.join(args.input_folder, "iter1.jsonl"), os.path.join(args.input_folder, "iter2.jsonl"), os.path.join(args.input_folder, "iter3.jsonl") 
-    for file in [round1_file, round2_file, round3_file]:
-        assert os.path.exists(file), f"Prediction {file} not found, three  rounds are required "
-     
-    round_items = {
-        "round1": process_single_round(round1_file),
-        "round2": process_single_round(round2_file),
-        "round3": process_single_round(round3_file)
+    judge_model = args.judge_model
+
+    judge_prompt_map = {
+        "gaia": JUDGE_PROMPT_GAIA,
+        "xbench": JUDGE_PROMPT_XBENCH,
+        "browsecomp": JUDGE_PROMPT_BROWSECOMP_OFFICIAL,
     }
+    judge_prompt = judge_prompt_map[args.judge_prompt]
+
+    print(f"Using judge_prompt: {args.judge_prompt}")
+    print(f"Using judge_model: {judge_model}")
+    print(f"Judge prompt:\n {judge_prompt}")
+
+    num_rounds = args.num_rounds
+    assert 1 <= num_rounds <= 3, "num_rounds must be between 1 and 3"
+
+    round_files = [os.path.join(args.input_folder, f"iter{i}.jsonl") for i in range(1, num_rounds + 1)]
+    for file in round_files:
+        assert os.path.exists(file), f"Prediction {file} not found"
+
+    round_items = {f"round{i+1}": process_single_round(f) for i, f in enumerate(round_files)}
 
     round_results = {} 
 
@@ -498,8 +510,10 @@ def main():
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Evaluating {round_name}"):
                 round_results[round_name].append(future.result())
     
-    for round_name in ["round1", "round2", "round3"]:
-        input_file = {"round1": round1_file, "round2": round2_file, "round3": round3_file}[round_name]
+    round_names = list(round_items.keys())
+    
+    for round_name in round_names:
+        input_file = round_files[round_names.index(round_name)]
         scored_file = input_file.replace(".jsonl", "_scored.jsonl")
         original_items = round_items[round_name]
         
@@ -518,25 +532,35 @@ def main():
                 scored_item.update(orig_item)
                 f.write(json.dumps(scored_item, ensure_ascii=False) + '\n')
 
-    aggr_results = aggregate_results(round_results["round1"], round_results["round2"], round_results["round3"]) 
+    round_results_list = [round_results[rn] for rn in round_names]
+    aggr_results = aggregate_results(*round_results_list) 
     
     pass_at_3 = calculate_pass_at_k(aggr_results, k=3)
     best_pass_at_1 = calculate_best_pass_at_1(aggr_results)
     avg_pass_at_3 = calculate_avg_pass_at_3(aggr_results) 
     
 
-    round_performance = {
-        f"Round{i}_Pass@1": round(sum(1 for r in round_results[f"round{i}"] if is_correct_judgement(r["judgement"])) / len(round_results[f"round{i}"]) * 100, 2)
-        for i in [1, 2, 3]
-    }
+    round_performance = {}
+    for i in range(1, num_rounds + 1):
+        round_name = f"round{i}"
+        round_performance[f"Round{i}_Pass@1"] = round(
+            sum(1 for r in round_results[round_name] if is_correct_judgement(r["judgement"])) 
+            / len(round_results[round_name]) * 100, 2
+        )
 
     print(f"===========")
-    print(f"Avg. Pass@3 {avg_pass_at_3}%") 
-    print(f"Best Pass@1 {best_pass_at_1}%")  
-    print(f"Pass@3 {pass_at_3}%") 
-    print(f"Pass@1 Round 1: {round_performance['Round1_Pass@1']}%  Round 2: {round_performance['Round2_Pass@1']}%  Round 3: {round_performance['Round3_Pass@1']}% \n")
+    if num_rounds > 1:
+        pass_at_3 = calculate_pass_at_k(aggr_results, k=3)
+        best_pass_at_1 = calculate_best_pass_at_1(aggr_results)
+        avg_pass_at_3 = calculate_avg_pass_at_3(aggr_results) 
+        print(f"Avg. Pass@3 {avg_pass_at_3}%") 
+        print(f"Best Pass@1 {best_pass_at_1}%")  
+        print(f"Pass@3 {pass_at_3}%")
     
-    aggr_statistics = aggregate_statistics(round1_file, round2_file, round3_file)
+    round_perf_str = "  ".join([f"Round {i}: {round_performance[f'Round{i}_Pass@1']}%" for i in range(1, num_rounds + 1)])
+    print(f"Pass@1 {round_perf_str}\n")
+
+    aggr_statistics = aggregate_statistics(*round_files)
     print(f"# Invalid {aggr_statistics['num_invalid']}  # Extra Length {aggr_statistics['extra_length']}") 
     print(f"Avg. Action {aggr_statistics['avg_action']:.2f}  Avg. Visit Action {aggr_statistics['avg_visit_action']:.2f}  Avg. Search Action {aggr_statistics['avg_search_action']:.2f}  Avg. Other Action {aggr_statistics['avg_other_action']:.2f}") 
     print(f"Avg. Answer Length {aggr_statistics['avg_ans_length']:.2f}  Avg. Thinking Length {aggr_statistics['avg_think_length']:.2f}")
@@ -554,28 +578,27 @@ def main():
     
     print(f"===========" )
 
-    overall_eval_dict = {
-        "dataset": dataset, 
-        "files": {
-            "round1": round1_file,  
-            "round2": round2_file,   
-            "round3": round3_file
-        }, 
-        "overall": {
-            "avg_pass_at_3": avg_pass_at_3, 
-            "best_pass_at_1": best_pass_at_1, 
-            "pass_at_3": pass_at_3
-        }, 
-        "individual": round_performance, 
+    overall_dict = {
+        "num_rounds": num_rounds,
+        "files": {f"round{i+1}": round_files[i] for i in range(num_rounds)},
+        "overall": {},
+        "individual": round_performance,
         "statistics": {**aggr_statistics, **enhanced_statistics}
     }
 
+    if num_rounds > 1:
+        overall_dict["overall"] = {
+            "avg_pass_at_3": avg_pass_at_3,
+            "best_pass_at_1": best_pass_at_1,
+            "pass_at_3": pass_at_3
+        }
+
     with open(args.restore_result_path, 'a', encoding='utf-8') as jsonl_file:
-        jsonl_file.write(json.dumps(overall_eval_dict, ensure_ascii=False) + '\n')
+        jsonl_file.write(json.dumps(overall_dict, ensure_ascii=False) + '\n')
 
 
 if __name__ == "__main__":
-    judge_prompt, dataset = None, ""
+    judge_prompt, judge_model = None, ""
     try:
         main()
     except Exception as e:
