@@ -7,7 +7,7 @@ import tiktoken
 class MetricsCollector:
     """Collects per-sample metrics for model calls, tool calls, and prompt breakdown."""
 
-    SEARCH_TOOL_NAMES = {"search", "google_scholar"}
+    SEARCH_TOOL_NAMES = {"search", "aliyun_search", "google_scholar"}
 
     def __init__(self) -> None:
         self._encoding = tiktoken.get_encoding("cl100k_base")

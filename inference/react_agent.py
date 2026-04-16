@@ -33,6 +33,7 @@ TOOL_CLASS = [
     Scholar(),
     Visit(),
     Search(),
+    AliyunSearch(),
     PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
@@ -51,9 +52,12 @@ class MultiTurnReactAgent(FnCallAgent):
     def __init__(
         self,
         function_list: Optional[Union[List[Union[str, Dict, BaseTool]]]],
-        llm_cfg: Optional[Dict] = None) -> None:
+        llm_cfg: Optional[Dict] = None,
+        system_prompt: Optional[str] = None) -> None:
         super().__init__(llm=DummyLLM(), function_list=function_list)
         self.llm_generate_cfg = llm_cfg.get("generate_cfg", {}) if llm_cfg else {}
+        self.custom_system_prompt = system_prompt
+        self._function_list = function_list if function_list else []
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
         openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -164,7 +168,10 @@ class MultiTurnReactAgent(FnCallAgent):
         start_time = time.time()
         answer = data['item']['answer']
         self.user_prompt = question
-        system_prompt = SYSTEM_PROMPT
+        if self.custom_system_prompt:
+            system_prompt = self.custom_system_prompt
+        else:
+            system_prompt = SYSTEM_PROMPT
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
@@ -240,6 +247,10 @@ class MultiTurnReactAgent(FnCallAgent):
         effective_calls = 1
         status_code = None
         if tool_name in TOOL_MAP:
+            print(f"[DEBUG] custom_call_tool invoked with tool_name: '{tool_name}', args: {tool_args}")
+            if tool_name == "search" and "search" not in self._function_list and "aliyun_search" in self._function_list:
+                print(f"[DEBUG] Remapping 'search' to 'aliyun_search' (Serper not available, using Aliyun IQS)")
+                tool_name = "aliyun_search"
             tool_args["params"] = tool_args
             if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
                 query = tool_args.get("query", [])

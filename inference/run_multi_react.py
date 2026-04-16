@@ -7,6 +7,7 @@ from tqdm import tqdm
 import threading
 from datetime import datetime
 from react_agent import MultiTurnReactAgent
+from prompt import build_system_prompt
 import time
 import math
 
@@ -141,9 +142,21 @@ if __name__ == "__main__":
             }
         }
 
+        default_tools = ["search", "visit", "google_scholar", "PythonInterpreter"]
+        available_tools_str = os.getenv("AVAILABLE_TOOLS", ",".join(default_tools))
+        function_list = [t.strip() for t in available_tools_str.split(",") if t.strip()]
+        print(f"[DEBUG] AVAILABLE_TOOLS env: '{available_tools_str}'")
+        print(f"[DEBUG] function_list: {function_list}")
+        system_prompt = build_system_prompt(function_list)
+        has_search = '"name": "search"' in system_prompt
+        has_aliyun = '"name": "aliyun_search"' in system_prompt
+        print(f"[DEBUG] System prompt contains 'search': {has_search}")
+        print(f"[DEBUG] System prompt contains 'aliyun_search': {has_aliyun}")
+
         test_agent = MultiTurnReactAgent(
             llm_cfg=llm_cfg,
-            function_list=["search", "visit", "google_scholar", "PythonInterpreter"]
+            function_list=function_list,
+            system_prompt=system_prompt
         )
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}
