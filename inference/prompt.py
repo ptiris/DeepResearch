@@ -18,9 +18,27 @@ You are provided with function signatures within <tools></tools> XML tags:
 {tool_schemas}
 </tools>
 
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+## Important Format Rules
+
+1. **Only ONE tool call per response**: Each response can contain at most ONE tool call.
+
+2. **Tool call format**: Use <tool_call></tool_call> XML tags to wrap JSON object:
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+3. **JSON requirements**:
+   - Use standard JSON format with double quotes
+   - Do NOT use single quotes
+   - Do NOT nest XML tags inside JSON string values (e.g., {"name": "<search>...", "arguments": {}} is WRONG)
+
+4. **Python Interpreter special format**: The code must be placed within <code></code> tags outside the JSON:
+<tool_call>
+{"name": "PythonInterpreter", "arguments": {}}
+<code>
+# Your Python code here
+print("Hello World")
+</code>
 </tool_call>
 
 Current date: """
@@ -41,6 +59,23 @@ EXTRACTOR_PROMPT = """Please process the following webpage content and user goal
 3. **Summary Output for Summary**: Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal.
 
 **Final Output Format using JSON format has "rational", "evidence", "summary" feilds**
+"""
+
+REPHASE_PROMPT = """
+You are given two search queries.
+
+Merge them into ONE search query that:
+- preserves ALL important information from both queries
+- keeps constraints such as site:, year, location, names
+- does NOT make the query more general
+- is concise and suitable for a search engine
+
+If merging would lose important information, return Query 1 unchanged.
+
+Return ONLY the final query.
+
+Query 1: {q1}
+Query 2: {q2}
 """
 
 

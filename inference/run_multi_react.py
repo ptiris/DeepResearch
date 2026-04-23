@@ -23,6 +23,21 @@ if __name__ == "__main__":
     parser.add_argument("--roll_out_count", type=int, default=3)
     parser.add_argument("--total_splits", type=int, default=1)
     parser.add_argument("--worker_split", type=int, default=1)
+    
+    # Query deduplication parameters
+    redundancy_enabled = os.getenv("REDUNDANCY_ENABLED", "False").lower() in ("true", "1", "yes")
+    parser.add_argument("--enable_redundancy_check", action="store_true", default=redundancy_enabled,
+                        help="Enable query redundancy checking")
+    parser.add_argument("--redundancy_strategy", type=str, default=os.getenv("REDUNDANCY_STRATEGY", "rephase"),
+                        choices=["rephase", "skip", "cache"],
+                        help="Strategy for handling redundant queries: rephase, skip, or cache")
+    parser.add_argument("--redundancy_scope", type=str, default=os.getenv("REDUNDANCY_SCOPE", "single_turn"),
+                        choices=["single_turn", "global"],
+                        help="Scope for redundancy checking: single_turn or global")
+    parser.add_argument("--redundancy_similarity_threshold", type=float, default=float(os.getenv("REDUNDANCY_SIMILARITY_THRESHOLD", "0.8")),
+                        help="Similarity threshold for considering queries as redundant")
+    parser.add_argument("--redundancy_max_retries", type=int, default=int(os.getenv("REDUNDANCY_MAX_RETRIES", "2")),
+                        help="Maximum retries for rephase strategy")
     args = parser.parse_args()
 
     output_base = args.output
@@ -47,6 +62,12 @@ if __name__ == "__main__":
     print(f"Output directory: {dataset_dir}")
     print(f"Number of rollouts: {roll_out_count}")
     print(f"Data splitting: {worker_split}/{total_splits}")
+    print(f"Redundancy check enabled: {args.enable_redundancy_check}")
+    if args.enable_redundancy_check:
+        print(f"  Strategy: {args.redundancy_strategy}")
+        print(f"  Scope: {args.redundancy_scope}")
+        print(f"  Similarity threshold: {args.redundancy_similarity_threshold}")
+        print(f"  Max retries: {args.redundancy_max_retries}")
     try:
         if data_filepath.endswith(".json"):
             with open(data_filepath, "r", encoding="utf-8") as f:
@@ -156,7 +177,12 @@ if __name__ == "__main__":
         test_agent = MultiTurnReactAgent(
             llm_cfg=llm_cfg,
             function_list=function_list,
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            enable_redundancy_check=args.enable_redundancy_check,
+            redundancy_strategy=args.redundancy_strategy,
+            redundancy_scope=args.redundancy_scope,
+            redundancy_similarity_threshold=args.redundancy_similarity_threshold,
+            redundancy_max_retries=args.redundancy_max_retries
         )
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}

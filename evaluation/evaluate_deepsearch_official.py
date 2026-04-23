@@ -4,6 +4,7 @@ import concurrent.futures
 from typing import Literal
 import litellm 
 import os 
+from dotenv import load_dotenv
 import argparse
 import json
 import concurrent 
@@ -15,13 +16,16 @@ import traceback
 import tiktoken
 import time
 import threading
+import requests
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 thread_local = threading.local()
 
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY","")
-os.environ['OPENAI_API_BASE'] = os.getenv("OPENAI_API_BASE","")
-API_KEY= os.getenv("API_KEY","")
-BASE_URL=os.getenv("BASE_URL","")
 DASHSCOPE_API_KEY=os.getenv("DASHSCOPE_API_KEY","")
+os.environ["OPENAI_API_KEY"] = DASHSCOPE_API_KEY
+os.environ['OPENAI_API_BASE'] = os.getenv("OPENAI_API_BASE","")
+API_KEY = DASHSCOPE_API_KEY
+BASE_URL=os.getenv("BASE_URL","")
 
 def get_client():
     if not hasattr(thread_local, 'client'):
@@ -89,51 +93,44 @@ def call_llm_judge(item):
     response = item["prediction"].strip()
     prompt = judge_prompt.format(question=question, correct_answer=correct_answer, response=response)
     
+    api_key = DASHSCOPE_API_KEY
+    base_url = BASE_URL or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    
+    model_name = judge_model
+    if '/' in judge_model:
+        model_name = judge_model.split('/')[-1]
+    
     for attempt in range(100):
         try: 
-            if 'dashscope' in judge_model or '/' in judge_model:
-                api_key = DASHSCOPE_API_KEY or os.getenv("DASHSCOPE_API_KEY","")
-                os.environ["DASHSCOPE_API_KEY"] = api_key
-                if '/' in judge_model:
-                    judge_model_with_provider = judge_model
-                else:
-                    judge_model_with_provider = f"dashscope/{judge_model}"
-                response = litellm.completion(
-                    model=judge_model_with_provider,
-                    messages=[{"role": "user", "content": prompt}],
-                    api_key=api_key,
-                    api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    num_retries=5
-                )
-                judgement = response.choices[0].message["content"]
-            elif judge_model == "openai/qwen2.5-72b-instruct":
-                response = litellm.completion(
-                    model=judge_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    num_retries=5
-                )
-                judgement = response.choices[0].message["content"]
-            elif judge_model == "google/gemini-2.0-flash-001":
-                client = get_client()
-                response_obj = client.beta.chat.completions.parse(
-                    model=judge_model,
-                    max_completion_tokens=8192, 
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format=extracted_answer_format_for_xbench,
-                    timeout=100.0
-                ) 
-                raw_judge = json.loads(response_obj.choices[0].message.content)
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8192
+            }
+            
+            if judge_model == "google/gemini-2.0-flash-001":
+                payload["response_format"] = extracted_answer_format_for_xbench
+            
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=100.0
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if judge_model == "google/gemini-2.0-flash-001":
+                raw_judge = json.loads(result["choices"][0]["message"]["content"])
                 judgement = "Correct" if raw_judge["结论"].lower() == "正确" else ""
-
             else:
-                response = litellm.completion(
-                    model=judge_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    num_retries=5
-                )
-                judgement = response.choices[0].message["content"]
+                judgement = result["choices"][0]["message"]["content"]
 
             return {
                 "question": question, 
@@ -151,7 +148,7 @@ def call_llm_judge(item):
                     "error": str(e)
                 }
             time.sleep(3)
-            continue  
+            continue
 
 
 def process_single_round(input_file): 
