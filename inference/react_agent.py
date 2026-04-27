@@ -332,14 +332,23 @@ class MultiTurnReactAgent(FnCallAgent):
                 if deduplication_result["has_redundant"]:
                     # Handle based on strategy
                     if self.redundancy_strategy == "rephase":
-                        result = self._handle_rephase_strategy(deduplication_result)
+                        merged_result = self._handle_rephase_strategy(deduplication_result)
+                        if isinstance(merged_result, list):
+                            print(f"[REDUNDANCY] Executing merged queries: {merged_result}")
+                            new_tool_args = tool_args.copy()
+                            new_tool_args["query"] = merged_result
+                            result = self._call_tool_and_update_history(
+                                tool_name, new_tool_args, metrics=metrics, tool_start=tool_start, **kwargs
+                            )
+                        else:
+                            result = merged_result
                     elif self.redundancy_strategy == "skip":
                         result = self._handle_skip_strategy(tool_name, tool_args, deduplication_result, metrics, tool_start, **kwargs)
                     elif self.redundancy_strategy == "cache":
                         result = self._handle_cache_strategy(tool_name, tool_args, deduplication_result, metrics, tool_start, **kwargs)
                     else:
                         result = self._call_tool_and_update_history(tool_name, tool_args, metrics=metrics, tool_start=tool_start, **kwargs)
-                    
+
                     return result
         
         if tool_name in TOOL_MAP:
@@ -472,31 +481,111 @@ class MultiTurnReactAgent(FnCallAgent):
             "embeddings": embeddings
         }
     
+    def _merge_queries_with_rephrase(self, q1: str, q2: str) -> str:
+        """
+        Merge two queries using the rephrase model and REPHASE_PROMPT.
+
+        Args:
+            q1: First query
+            q2: Second query
+
+        Returns:
+            str: Merged query
+        """
+        rephrase_model = os.getenv("REPHASE_MODEL", "")
+        if not rephrase_model:
+            print("[REDUNDANCY] REPHASE_MODEL not set, returning q2 unchanged")
+            return q2
+
+        prompt_content = REPHASE_PROMPT.format(q1=q1, q2=q2)
+
+        provider = os.getenv('PROVIDER', 'openrouter')
+        if provider == 'openrouter':
+            api_key = os.getenv("OPENROUTER_API_KEY", "")
+            api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+        elif provider == 'dashscope':
+            api_key = os.getenv("DASHSCOPE_API_KEY", "")
+            api_base = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
+        else:
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+
+        if not api_key:
+            print("[REDUNDANCY] No API key available, returning q2 unchanged")
+            return q2
+
+        client = OpenAI(api_key=api_key, base_url=api_base, timeout=60.0)
+
+        messages = [{"role": "user", "content": prompt_content}]
+
+        try:
+            print(f"[REDUNDANCY] Calling rephrase model: {rephrase_model}")
+            chat_response = client.chat.completions.create(
+                model=rephrase_model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=256,
+            )
+            merged_query = chat_response.choices[0].message.content.strip()
+            print(f"[REDUNDANCY] Merged '{q1}' + '{q2}' -> '{merged_query}'")
+            return merged_query
+        except Exception as e:
+            print(f"[REDUNDANCY] Error calling rephrase model: {e}, returning q2 unchanged")
+            return q2
+
     def _handle_rephase_strategy(self, deduplication_result: Dict) -> str:
         """
-        Handle rephase strategy for redundant queries
+        Handle rephase strategy for redundant queries.
+
+        For single_turn scope: directly merge similar queries using rephrase model.
+        For global scope: fall back to the original feedback-based approach.
 
         Args:
             deduplication_result: Result from _check_query_redundancy
 
         Returns:
-            str: Feedback message to trigger rephasing
+            str: Merged query list or feedback message
         """
         print(f"[REDUNDANCY] Using rephase strategy to handle redundant queries")
-        redundant_queries = deduplication_result["redundant_queries"]
 
-        # Build feedback message
-        if self.redundancy_scope == "single_turn":
-            queries_in_turn = [q["query"] for q in redundant_queries]
-            feedback = f"You have already proposed queries: {queries_in_turn} in this turn. "
-        else:
+        if self.redundancy_scope != "single_turn":
+            redundant_queries = deduplication_result["redundant_queries"]
             similar_queries = [q["similar_to"][0]["query"] for q in redundant_queries if q["similar_to"]]
             feedback = f"You have already proposed similar queries: {similar_queries}. "
+            feedback += "Please make sure your new queries are not similar to these previous queries."
+            return f"[REDUNDANCY] {feedback}"
 
-        feedback += "Please make sure your new queries are not similar to these previous queries."
+        query_list = deduplication_result["query_list"]
+        embeddings = deduplication_result["embeddings"]
 
-        # Do NOT add to history for rephase strategy
-        return f"[REDUNDANT_REPHASE] {feedback}"
+        processed_queries = []
+        processed_embeddings = []
+
+        for i, (query, emb) in enumerate(zip(query_list, embeddings)):
+            merged = False
+            for j, rep_emb in enumerate(processed_embeddings):
+                sim = self.embedding_client.similarity(emb, rep_emb)
+                if sim >= self.redundancy_similarity_threshold:
+                    rep_query = processed_queries[j]
+                    print(f"[REDUNDANCY] Query '{query}' is similar to '{rep_query}' (similarity: {sim:.4f}), merging")
+                    merged_query = self._merge_queries_with_rephrase(rep_query, query)
+                    processed_queries.pop(j)
+                    processed_embeddings.pop(j)
+                    merged_emb = self.embedding_client.encode([merged_query])[0]
+                    processed_queries.append(merged_query)
+                    processed_embeddings.append(merged_emb)
+                    merged = True
+                    break
+
+            if not merged:
+                processed_queries.append(query)
+                processed_embeddings.append(emb)
+
+        print(f"[REDUNDANCY] Merged query list: {processed_queries}")
+
+        if len(processed_queries) == 1:
+            return processed_queries[0]
+        return processed_queries
     
     def _handle_skip_strategy(self, tool_name: str, tool_args: Dict, deduplication_result: Dict,
                              metrics: Optional[MetricsCollector], tool_start: float, **kwargs) -> str:
