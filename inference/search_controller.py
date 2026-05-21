@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+# Enum Classes : Action and Tool Status
 
 class SearchAction(str, Enum):
     EXECUTE = "execute"
@@ -22,7 +23,9 @@ class ToolStatus(str, Enum):
     CACHED = "cached"
     SKIPPED = "skipped"
 
+
 class SearchRequest:
+    
     def __init__(
         self,
         task_id: str,
@@ -43,6 +46,7 @@ class SearchRequest:
         self.raw_args = raw_args
         self.requested_topk = requested_topk
 
+# Configured Classes
 
 class ContextProfile:
     def __init__(
@@ -92,7 +96,7 @@ class BudgetState:
 
 @dataclass
 class SearchMemoryEntry:
-    query: list[str]
+    query: str
     query_embedding: list[float]
     turn_id: int
     tool_name: str
@@ -149,17 +153,26 @@ class QueryDecision:
 
 
 @dataclass
+class QueryBlock:
+    queries: list[str]
+    original_indices: list[int]
+    action: SearchAction
+    reason: str
+    cache_entry: Optional[SearchMemoryEntry] = None
+    adjusted_topk: Optional[int] = None
+
+
+@dataclass
 class PreSearchDecision:
     task_id: str
     turn_id: int
-    query_decisions: list[QueryDecision]
+    query_blocks: list[QueryBlock]
 
 
 @dataclass
 class ControllerState:
     memory: SearchMemory
     budget_state: BudgetState
-    context_profile: ContextProfile
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -177,15 +190,22 @@ class SearchController:
         self,
         params: dict | None = None,
         embed_fn=None,
+        context_profile: ContextProfile | None = None,
     ):
+        
         self.params = params or {}
         self.embed_fn = embed_fn  # Callable[[str], list[float]]
+        self.context_profile = context_profile or ContextProfile(
+            policy="append_history",
+            replay_factor=2.0,
+            admission_policy="pass_through",
+            cache_replay_policy="pointer",
+        )
 
         self.high_sim = self.params.get("high_similarity", 0.90)
         self.medium_sim = self.params.get("medium_similarity", 0.75)
         self.pointer_turn_dist = self.params.get("pointer_turn_distance", 3)
 
-        
         self.cost_per_search = self.params.get("cost_per_search", 0.01)
         self.cost_per_obs_token = self.params.get("cost_per_obs_token", 0.00001)
         self.estimated_obs_tokens = self.params.get("estimated_obs_tokens", 800)
@@ -206,48 +226,64 @@ class SearchController:
         request: SearchRequest,
         state: ControllerState,
     ) -> PreSearchDecision:
-        """Section 6: pre-search decides per-query action before any API call."""
         query_list = request.query_list
         n = len(query_list)
 
-        # Embed all queries
         embeddings = self._embed_queries(query_list)
-
-        # Step 1: Intra-call redundancy (Section 6.1)
         intra_sim = self._compute_intra_similarity(embeddings)
-
-        # Step 2: Cross-turn cache lookup (Section 6.2)
         cache_hits = [
             state.memory.find_similar(emb, top_k=3) for emb in embeddings
         ]
-
-        # Step 3: Budget pressure (Section 6.6)
         pressure = state.budget_state.pressure
         pressure_level = state.budget_state.pressure_level
 
-        # Step 4: Decide per-query action (Section 6.7 decision table)
-        decisions: list[Optional[QueryDecision]] = [None] * n
+        assigned: set[int] = set()
+        blocks: list[QueryBlock] = []
+
 
         for i in range(n):
-            if decisions[i] is not None:
+            if i in assigned:
                 continue
-            decisions[i] = self._decide_query(
+
+            merge_group = [i]
+            for k in range(i + 1, n):
+                if k not in assigned and intra_sim[i][k] >= self.high_sim:
+                    merge_group.append(k)
+
+            if len(merge_group) > 1:
+                blocks.append(QueryBlock(
+                    queries=[query_list[idx] for idx in merge_group],
+                    original_indices=merge_group,
+                    action=SearchAction.MERGE,
+                    reason=f"high intra-call similarity among queries {merge_group}",
+                ))
+                assigned.update(merge_group)
+                continue
+
+            decision = self._decide_single_query(
                 index=i,
                 query_list=query_list,
-                embeddings=embeddings,
                 intra_sim=intra_sim,
                 cache_hits=cache_hits,
                 pressure=pressure,
                 pressure_level=pressure_level,
-                context_profile=state.context_profile,
                 budget_state=state.budget_state,
-                decisions=decisions,
             )
+
+            blocks.append(QueryBlock(
+                queries=[query_list[i]],
+                original_indices=[i],
+                action=decision.action,
+                reason=decision.reason,
+                cache_entry=decision.cache_entry,
+                adjusted_topk=decision.adjusted_topk,
+            ))
+            assigned.add(i)
 
         return PreSearchDecision(
             task_id=request.task_id,
             turn_id=request.turn_id,
-            query_decisions=[d for d in decisions if d is not None],
+            query_blocks=blocks,
         )
 
 
@@ -306,89 +342,47 @@ class SearchController:
         )
 
 
-    def _decide_query(
+    def _decide_single_query(
         self,
         index: int,
         query_list: list[str],
-        embeddings: list[list[float]],
         intra_sim: list[list[float]],
         cache_hits: list[list[tuple[SearchMemoryEntry, float]]],
         pressure: float,
         pressure_level: str,
-        context_profile: ContextProfile,
         budget_state: BudgetState,
-        decisions: list[Optional[QueryDecision]],
     ) -> QueryDecision:
         query = query_list[index]
-        emb = embeddings[index]
 
-        # --- Check 1: Intra-call merge (Section 6.1) ---
-        for j in range(index):
-            if decisions[j] is not None and decisions[j].action == SearchAction.MERGE:
-                # Already merged into something else, skip
-                if decisions[j].merged_with_index is not None and decisions[j].merged_with_index < j:
-                    continue
-            if intra_sim[index][j] >= self.high_sim:
-                return QueryDecision(
-                    query=query,
-                    original_index=index,
-                    action=SearchAction.MERGE,
-                    reason=f"high intra-call similarity ({intra_sim[index][j]:.3f}) with query[{j}]: '{query_list[j]}'",
-                    merged_with_index=j,
-                )
-
-        # --- Check 2: Cross-turn cache lookup (Section 6.2) ---
         best_entry, best_sim = self._best_cache_hit(cache_hits[index])
 
         if best_entry is not None and best_sim >= self.high_sim:
-            turn_dist = budget_state.current_turn - best_entry.turn_id
+            turn_dist = budget_state.current_turn - best_entry.turn_id # Forget when turn_dist is sometimes too far
 
-            # Case 2a: cached result was successful non-empty
             if best_entry.tool_status == ToolStatus.SUCCESS_NONEMPTY:
-                # Determine replay style based on context visibility
-                if context_profile.policy == "iterative_report":
-                    # IterResearch: always replay full (Section 6.4)
-                    return QueryDecision(
-                        query=query,
-                        original_index=index,
-                        action=SearchAction.REUSE_CACHE,
-                        reason=f"cache hit (sim={best_sim:.3f}) with successful query: '{best_entry.query}'",
-                        cache_entry=best_entry,
-                    )
-                else:
-                    # ReAct/Tongyi: visibility-based replay (Section 6.5)
-                    return QueryDecision(
-                        query=query,
-                        original_index=index,
-                        action=SearchAction.REUSE_CACHE,
-                        reason=f"cache hit (sim={best_sim:.3f}, turn_dist={turn_dist}) with successful query: '{best_entry.query}'",
-                        cache_entry=best_entry,
-                    )
+                return QueryDecision(
+                    query=query,
+                    original_index=index,
+                    action=SearchAction.REUSE_CACHE,
+                    reason=f"cache hit (sim={best_sim:.3f}, turn_dist={turn_dist}) with successful query: '{best_entry.query}'",
+                    cache_entry=best_entry,
+                )
 
-            # Case 2b: cached result was empty or failed
             if best_entry.tool_status in (ToolStatus.EMPTY, ToolStatus.FAILED):
-                # Section 6.2: mark as repeated-failure risk; still execute if query changed enough
                 if best_sim >= 0.95:
-                    # Near-exact repeat of a failed query -> rewrite_request
                     return QueryDecision(
                         query=query,
                         original_index=index,
-                        action=SearchAction.REWRITE_REQUEST,
+                        action=SearchAction.EXECUTE,
                         reason=f"near-exact repeat of {best_entry.tool_status.value} query (sim={best_sim:.3f}): '{best_entry.query}'",
                         cache_entry=best_entry,
                     )
-                else:
-                    # Similar but not identical -> execute, but flag the risk
-                    pass  # fall through to budget check below
+                
 
-        # --- Check 3: medium-similarity intra-call (Section 6.1) ---
-        for j in range(index):
-            if decisions[j] is not None and decisions[j].action == SearchAction.MERGE:
-                continue
-            if self.medium_sim <= intra_sim[index][j] < self.high_sim:
-                if pressure_level == "high":
-                    # Section 6.1: medium sim + high pressure -> reduce_topk
-                    adjusted_topk = self._reduce_topk(budget_state, context_profile)
+        if pressure_level == "high" and self.context_profile.admission_policy == "budgeted":
+            for j in range(index):
+                if self.medium_sim <= intra_sim[index][j] < self.high_sim:
+                    adjusted_topk = self._reduce_topk(budget_state)
                     return QueryDecision(
                         query=query,
                         original_index=index,
@@ -397,9 +391,7 @@ class SearchController:
                         adjusted_topk=adjusted_topk,
                     )
 
-        # --- Check 4: Budget pressure (Section 6.6) ---
-        if pressure_level == "high":
-            adjusted_topk = self._reduce_topk(budget_state, context_profile)
+            adjusted_topk = self._reduce_topk(budget_state)
             return QueryDecision(
                 query=query,
                 original_index=index,
@@ -408,7 +400,6 @@ class SearchController:
                 adjusted_topk=adjusted_topk,
             )
 
-        # --- Default: execute ---
         return QueryDecision(
             query=query,
             original_index=index,
@@ -423,11 +414,29 @@ class SearchController:
     def _reduce_topk(
         self,
         budget_state: BudgetState,
-        context_profile: ContextProfile,
     ) -> int:
-        """Reduce requested top-k proportionally to pressure level."""
         base_topk = self.params.get("default_topk", 10)
         pressure = budget_state.pressure
-        # Linearly scale down: at pressure=1.0, return 30% of base
         reduced = max(3, int(base_topk * (1.0 - 0.7 * pressure)))
         return reduced
+
+    def post_search(
+        self,
+        request: SearchRequest,
+        raw_result: str,
+        state: ControllerState,
+    ) -> str:
+        # TODO: 解析 raw_result → url_list, domain_list, title_snippet_list, token counts
+        # TODO: 构建 SearchMemoryEntry
+        # TODO: 根据 context_profile 决定返回给 agent 的 observation 长度
+        # TODO: state.memory.add(entry)
+        return raw_result  # pass-through for now
+
+    def update_memory(
+        self,
+        entry: SearchMemoryEntry,
+        state: ControllerState,
+    ) -> None:
+        # TODO: 查重/压缩后加入 state.memory
+        # TODO: 更新 BudgetState (effective_search_calls, observation_tokens_used)
+        state.memory.add(entry)
