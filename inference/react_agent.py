@@ -19,6 +19,10 @@ import asyncio
 import numpy as np
 from metrics import MetricsCollector
 from model_client import ModelClient
+from search_controller import (
+    SearchController, SearchRequest, ControllerState, SearchMemory,
+    BudgetState, ContextProfile, SearchAction, SearchMemoryEntry, PreSearchDecision
+)
 
 from tool_file import *
 from tool_scholar import *
@@ -31,7 +35,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utils.embedding_client import EmbeddingClient
-from utils.query_deduplication import QueryHistory
+
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -63,27 +67,34 @@ class MultiTurnReactAgent(FnCallAgent):
         self,
         function_list: Optional[Union[List[Union[str, Dict, BaseTool]]]],
         llm_cfg: Optional[Dict] = None,
-        system_prompt: Optional[str] = None,
-        enable_redundancy_check: bool = False,
-        redundancy_strategy: str = "rephase",
-        redundancy_scope: str = "single_turn",
-        redundancy_similarity_threshold: float = 0.8,
-        redundancy_max_retries: int = 2) -> None:
+        system_prompt: Optional[str] = None) -> None:
         super().__init__(llm=DummyLLM(), function_list=function_list)
         self.llm_generate_cfg = llm_cfg.get("generate_cfg", {}) if llm_cfg else {}
         self.custom_system_prompt = system_prompt
         self._function_list = function_list if function_list else []
         
-        # Query deduplication configuration
-        self.enable_redundancy_check = enable_redundancy_check
-        self.redundancy_strategy = redundancy_strategy
-        self.redundancy_scope = redundancy_scope
-        self.redundancy_similarity_threshold = redundancy_similarity_threshold
-        self.redundancy_max_retries = redundancy_max_retries
+        # Initialize SearchController
+        self.embedding_client = EmbeddingClient()
+        self.search_controller = SearchController(
+            params={"high_similarity": 0.90, "medium_similarity": 0.75, "default_topk": 10},
+            embed_fn=lambda q: self.embedding_client.encode([q])[0].tolist(),
+            context_profile=ContextProfile(
+                policy="append_history",
+                replay_factor=2.0,
+                admission_policy="budgeted",
+                cache_replay_policy="pointer",
+            ),
+        )
+        self.controller_state = ControllerState(
+            memory=SearchMemory(),
+            budget_state=BudgetState(
+                search_call_budget=10,
+                observation_token_budget=8000,
+                max_turns=MAX_LLM_CALL_PER_RUN,
+            ),
+        )
+        self.turn_id = 0
         
-        # Initialize embedding client (will be initialized per question in _run)
-        self.embedding_client = None
-        self.query_history = None
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
         model_client = ModelClient('research')
@@ -229,15 +240,7 @@ class MultiTurnReactAgent(FnCallAgent):
         system_prompt = system_prompt + str(cur_date)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
         
-        # Initialize query deduplication components
-        if self.enable_redundancy_check:
-            print(f"[REDUNDANCY] Initializing redundancy check (strategy: {self.redundancy_strategy}, scope: {self.redundancy_scope}, threshold: {self.redundancy_similarity_threshold})")
-            self.embedding_client = EmbeddingClient()
-            self.query_history = QueryHistory()
-        else:
-            print(f"[REDUNDANCY] Redundancy check is disabled")
         self.turn_id = 0
-        rephase_retry_count = 0
         json_retry_count = 0
         
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
@@ -321,29 +324,6 @@ class MultiTurnReactAgent(FnCallAgent):
                             )
                         
                         result = self.custom_call_tool(tool_name, tool_args, _metrics=metrics)
-                        
-                        # Check if result contains REDUNDANT_REPHASE marker
-                        if isinstance(result, str) and "[REDUNDANT_REPHASE]" in result:
-                            if rephase_retry_count < self.redundancy_max_retries:
-                                rephase_retry_count += 1
-                                print(f"[REDUNDANCY] Rephasing attempt {rephase_retry_count}/{self.redundancy_max_retries}")
-                                
-                                # Add feedback to messages and retry
-                                messages.append({"role": "user", "content": result})
-                                model_response = self.call_server(messages, metrics=metrics)
-                                content = model_response.get("content", "")
-                                print(f'Round {round}.{rephase_retry_count}: {content}')
-                                if OBS_END in content:
-                                    pos = content.find(OBS_END)
-                                    content = content[:pos]
-                                messages.append({"role": "assistant", "content": content.strip()})
-                                
-                                # Continue to next iteration to parse new tool call
-                                num_llm_calls_available += 1  # Don't count this as a new LLM call
-                                continue
-                            else:
-                                print(f"[REDUNDANCY] Max retries ({self.redundancy_max_retries}) exceeded, proceeding with execution")
-                                # Proceed with current result (will be added to messages below)
                 except Exception as e:
                     max_json_retries = 5
                     if json_retry_count < max_json_retries:
@@ -439,55 +419,19 @@ class MultiTurnReactAgent(FnCallAgent):
         # Increment turn_id for each tool call
         self.turn_id += 1
 
-        # Check if redundancy checking is enabled for search tools
-        if self.enable_redundancy_check and tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
-            query_list = tool_args.get("query", [])
-            if isinstance(query_list, str):
-                query_list = [query_list]
+        # ========== Branch A: Search tools → SearchController ==========
+        if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
+            return self._execute_search_with_controller(
+                tool_name, tool_args, metrics, tool_start, **kwargs
+            )
 
-            if query_list:
-                print(f"[REDUNDANCY] Checking {len(query_list)} queries for redundancy (scope: {self.redundancy_scope})")
-                # Perform redundancy check
-                deduplication_result = self._check_query_redundancy(query_list)
-                print(f"[REDUNDANCY] Found {len(deduplication_result['redundant_queries'])} redundant queries, {len(deduplication_result['non_redundant_queries'])} non-redundant")
-                
-                if deduplication_result["has_redundant"]:
-                    # Handle based on strategy
-                    if self.redundancy_strategy == "rephase":
-                        merged_result = self._handle_rephase_strategy(deduplication_result, metrics)
-                        if isinstance(merged_result, list):
-                            print(f"[REDUNDANCY] Executing merged queries: {merged_result}")
-                            new_tool_args = tool_args.copy()
-                            new_tool_args["query"] = merged_result
-                            result = self._call_tool_and_update_history(
-                                tool_name, new_tool_args, metrics=metrics, tool_start=tool_start, **kwargs
-                            )
-                        else:
-                            result = merged_result
-                    elif self.redundancy_strategy == "skip":
-                        result = self._handle_skip_strategy(tool_name, tool_args, deduplication_result, metrics, tool_start, **kwargs)
-                    elif self.redundancy_strategy == "cache":
-                        result = self._handle_cache_strategy(tool_name, tool_args, deduplication_result, metrics, tool_start, **kwargs)
-                    else:
-                        result = self._call_tool_and_update_history(tool_name, tool_args, metrics=metrics, tool_start=tool_start, **kwargs)
-
-                    return result
-        else:
-            if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
-                print(f"[REDUNDANCY] Skipped: enable_redundancy_check={self.enable_redundancy_check} (search tool '{tool_name}' called without redundancy check)")
-        
+        # ========== Branch B: Non-search tools → Original dispatch ==========
         if tool_name in TOOL_MAP:
             print(f"[DEBUG] custom_call_tool invoked with tool_name: '{tool_name}', args: {tool_args}")
             if tool_name == "search" and "search" not in self._function_list and "aliyun_search" in self._function_list:
                 print(f"[DEBUG] Remapping 'search' to 'aliyun_search' (Serper not available, using Aliyun IQS)")
                 tool_name = "aliyun_search"
             tool_args["params"] = tool_args
-            if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
-                query = tool_args.get("query", [])
-                if isinstance(query, list):
-                    effective_calls = len(query)
-                elif isinstance(query, str):
-                    effective_calls = 1
             try:
                 if "python" in tool_name.lower():
                     result = TOOL_MAP['PythonInterpreter'].call(tool_args)
@@ -535,431 +479,103 @@ class MultiTurnReactAgent(FnCallAgent):
                     status_code=status_code,
                 )
             return result
-    
-    def _check_query_redundancy(self, query_list: List[str]) -> Dict:
-        """
-        Check for redundant queries in the query list
 
-        Args:
-            query_list: List of query strings
+    def _execute_search_with_controller(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        metrics: Optional[MetricsCollector],
+        tool_start: float,
+        **kwargs,
+    ) -> str:
+        query_list = tool_args.get("query", [])
+        if isinstance(query_list, str):
+            query_list = [query_list]
 
-        Returns:
-            Dict containing redundant and non-redundant queries
-        """
-        print(f"[REDUNDANCY] Computing embeddings for {len(query_list)} queries")
-        # Compute embeddings for all queries
-        embeddings = self.embedding_client.encode(query_list)
+        if not query_list:
+            return "[SearchController] Error: empty query list"
 
-        # Find similar queries
-        redundant_queries = []
-        non_redundant_queries = []
+        request = SearchRequest(
+            task_id=str(id(self)),
+            turn_id=self.turn_id,
+            tool_name=tool_name,
+            search_engine=tool_name,
+            query_list=query_list,
+            original_question=self.user_prompt,
+            raw_args=tool_args,
+            requested_topk=None,
+        )
+        self.controller_state.budget_state.current_turn = self.turn_id
 
-        # In single_turn mode, maintain a history list and check each query against it
-        seen_representative_queries = []  # List of (query_text, embedding) that are already kept
+        decision = self.search_controller.pre_search(request, self.controller_state)
 
-        for i, (query, emb) in enumerate(zip(query_list, embeddings)):
-            print(f"\n[REDUNDANCY] === Checking query {i}: '{query[:60]}' ===")
-            if self.redundancy_scope == "single_turn":
-                # Check against previously kept queries in current turn
-                sim_queries = []
-                if not seen_representative_queries:
-                    print(f"[REDUNDANCY]   No history to compare (first query in this turn)")
-                for rep_text, rep_emb in seen_representative_queries:
-                    sim = self.embedding_client.similarity(emb, rep_emb)
-                    status = "REDUNDANT" if sim >= self.redundancy_similarity_threshold else "unique"
-                    print(f"[REDUNDANCY]   vs '{rep_text[:50]}' -> sim={sim:.4f} (threshold={self.redundancy_similarity_threshold}) => {status}")
-                    if sim >= self.redundancy_similarity_threshold:
-                        sim_queries.append({
-                            "query": rep_text,
-                            "similarity": sim,
-                            "is_executed": None,
-                            "results": None
-                        })
-            else:  # global
-                # Compare with all historical queries
-                history_size = self.query_history.get_history_size()
-                print(f"[REDUNDANCY]   Global scope: comparing against {history_size} historical queries")
-                sim_queries = self.query_history.find_similar_queries(
-                    emb,
-                    self.redundancy_similarity_threshold,
-                    scope="global"
-                )
+        result = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
 
-            if sim_queries:
-                print(f"[REDUNDANCY] Query {i}: '{query[:60]}' => REDUNDANT (found {len(sim_queries)} similar)")
-                for sim_query in sim_queries:
-                    print(f"[REDUNDANCY]   Similar to: '{sim_query['query'][:50]}' (sim={sim_query['similarity']:.4f})")
-                redundant_queries.append({
-                    "index": i,
-                    "query": query,
-                    "embedding": emb,
-                    "similar_to": sim_queries
-                })
-            else:
-                print(f"[REDUNDANCY] Query {i}: '{query[:50]}...' is unique (no similar queries found)")
-                non_redundant_queries.append({
-                    "index": i,
-                    "query": query,
-                    "embedding": emb
-                })
-                if self.redundancy_scope == "single_turn":
-                    seen_representative_queries.append((query, emb))
+        # ============ START TODO: post_search - update controller memory pool ============
+        # For each executed QueryBlock (EXECUTE / REDUCE_TOPK / MERGE):
+        #   1. Parse raw_result → url_list, domain_list, title_snippet_list, token counts
+        #   2. Create SearchMemoryEntry with:
+        #      - query, query_embedding, turn_id, tool_name, search_engine
+        #      - action (from block.action), executed_external_api=True
+        #      - tool_status (infer from result: SUCCESS_NONEMPTY / EMPTY / FAILED)
+        #      - raw_result, returned_observation, url_list
+        #      - raw_observation_tokens, returned_observation_tokens, latency_ms
+        #   3. self.controller_state.memory.add(entry)
+        #
+        # For REUSE_CACHE blocks:
+        #   - entry.executed_external_api = False
+        #   - entry.tool_status = CACHED
+        #   - No duplicate memory entry needed (cache already exists in memory)
+        #
+        # Update BudgetState:
+        #   - self.controller_state.budget_state.effective_search_calls += n_executed
+        #   - self.controller_state.budget_state.observation_tokens_used += len(result_tokens)
+        #
+        # self.search_controller.post_search(request, result, self.controller_state)
+        # ============ END TODO ============
 
-        return {
-            "has_redundant": len(redundant_queries) > 0,
-            "redundant_queries": redundant_queries,
-            "non_redundant_queries": non_redundant_queries,
-            "query_list": query_list,
-            "embeddings": embeddings
-        }
-    
-    def _merge_queries_with_rephrase(self, q1: str, q2: str, metrics: Optional[MetricsCollector] = None) -> str:
-        """
-        Merge two queries using the rephrase model and REPHASE_PROMPT.
+        return result
 
-        Args:
-            q1: First query
-            q2: Second query
-            metrics: Metrics collector
-
-        Returns:
-            str: Merged query
-"""
-        import time
-        rephrase_client = ModelClient('rephrase')
-        if not rephrase_client.model:
-            print("[REDUNDANCY] REPHASE_MODEL not set, returning q2 unchanged")
-            return q2
-        if not rephrase_client.api_key:
-            print("[REDUNDANCY] No API key available, returning q2 unchanged")
-            return q2
-
-        prompt_content = REPHASE_PROMPT.format(q1=q1, q2=q2)
-        client = rephrase_client.get_client()
-
-        messages = [{"role": "user", "content": prompt_content}]
-
-        start_time = time.time()
-        try:
-            print(f"[REDUNDANCY] Calling rephrase model: {rephrase_client.model}")
-            chat_response = client.chat.completions.create(
-                model=rephrase_client.model,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=40960,
-            )
-            latency_ms = (time.time() - start_time) * 1000
-            content = chat_response.choices[0].message.content
-            if content is None:
-                content = chat_response.choices[0].message.reasoning
-            merged_query = content.strip()
-            print(f"[REDUNDANCY] Merged '{q1}' + '{q2}' -> '{merged_query}'")
-
-            if metrics:
-                usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
-                metrics.record_model_call(
-                    model_group="rephrase_model",
-                    success=True,
-                    latency_ms=latency_ms,
-                    usage=usage,
-                )
-                metrics.record_prompt_breakdown(
-                    model_group="rephrase_model",
-                    messages=messages,
-                    usage=usage,
-                )
-
-            return merged_query
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            print(f"[REDUNDANCY] Error calling rephrase model: {e}, returning q2 unchanged")
-
-            if metrics:
-                metrics.record_model_call(
-                    model_group="rephrase_model",
-                    success=False,
-                    latency_ms=latency_ms,
-                    usage=None,
-                )
-
-            return q2
-
-    def _handle_rephase_strategy(self, deduplication_result: Dict, metrics: Optional[MetricsCollector] = None) -> str:
-        """
-        Handle rephase strategy for redundant queries.
-
-        For single_turn scope: directly merge similar queries using rephrase model.
-        For global scope: fall back to the original feedback-based approach.
-
-        Args:
-            deduplication_result: Result from _check_query_redundancy
-            metrics: Metrics collector
-
-        Returns:
-            str: Merged query list or feedback message
-        """
-        print(f"[REDUNDANCY] Using rephase strategy to handle redundant queries")
-
-        if self.redundancy_scope != "single_turn":
-            redundant_queries = deduplication_result["redundant_queries"]
-            similar_queries = [q["similar_to"][0]["query"] for q in redundant_queries if q["similar_to"]]
-            feedback = f"You have already proposed similar queries: {similar_queries}. "
-            feedback += "Please make sure your new queries are not similar to these previous queries."
-            return f"[REDUNDANCY] {feedback}"
-
-        query_list = deduplication_result["query_list"]
-        embeddings = deduplication_result["embeddings"]
-
-        processed_queries = []
-        processed_embeddings = []
-
-        for i, (query, emb) in enumerate(zip(query_list, embeddings)):
-            merged = False
-            for j, rep_emb in enumerate(processed_embeddings):
-                sim = self.embedding_client.similarity(emb, rep_emb)
-                if sim >= self.redundancy_similarity_threshold:
-                    rep_query = processed_queries[j]
-                    print(f"[REDUNDANCY] Query '{query}' is similar to '{rep_query}' (similarity: {sim:.4f}), merging")
-                    merged_query = self._merge_queries_with_rephrase(rep_query, query, metrics)
-                    processed_queries.pop(j)
-                    processed_embeddings.pop(j)
-                    merged_emb = self.embedding_client.encode([merged_query])[0]
-                    processed_queries.append(merged_query)
-                    processed_embeddings.append(merged_emb)
-                    merged = True
-                    break
-
-            if not merged:
-                processed_queries.append(query)
-                processed_embeddings.append(emb)
-
-        print(f"[REDUNDANCY] Merged query list: {processed_queries}")
-
-        if len(processed_queries) == 1:
-            return processed_queries[0]
-        return processed_queries
-    
-    def _handle_skip_strategy(self, tool_name: str, tool_args: Dict, deduplication_result: Dict,
-                             metrics: Optional[MetricsCollector], tool_start: float, **kwargs) -> str:
-        """
-        Handle skip strategy for redundant queries
-
-        Args:
-            tool_name: Name of the tool
-            tool_args: Tool arguments
-            deduplication_result: Result from _check_query_redundancy
-            metrics: Metrics collector
-            tool_start: Tool start time
-
-        Returns:
-            str: Combined results with skipped queries marked
-        """
-        print(f"[REDUNDANCY] Using skip strategy: executing {len(deduplication_result['non_redundant_queries'])} unique queries, skipping {len(deduplication_result['redundant_queries'])} redundant queries")
-        redundant_queries = deduplication_result["redundant_queries"]
-        non_redundant = deduplication_result["non_redundant_queries"]
-        query_list = deduplication_result["query_list"]
-
-        # Execute non-redundant queries
+    def _execute_query_blocks(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        decision: PreSearchDecision,
+        metrics: Optional[MetricsCollector],
+        tool_start: float,
+        **kwargs,
+    ) -> str:
         results = {}
-        for item in non_redundant:
-            idx = item["index"]
-            query = item["query"]
-            emb = item["embedding"]
 
-            new_tool_args = tool_args.copy()
-            new_tool_args["query"] = [query] if len(query_list) > 1 else query
+        for block in decision.query_blocks:
+            if block.action in (SearchAction.EXECUTE, SearchAction.MERGE, SearchAction.REDUCE_TOPK):
+                block_args = tool_args.copy()
+                block_args["query"] = block.queries
+                try:
+                    raw = TOOL_MAP[tool_name].call(block_args, **kwargs)
+                    if isinstance(raw, tuple) and len(raw) == 2:
+                        block_result, _ = raw
+                    else:
+                        block_result = raw
+                except Exception as e:
+                    block_result = f"Error: Search query failed: {str(e)}"
 
-            print(f"[REDUNDANCY] Executing unique query {idx}: '{query[:50]}...'")
-            result = self._call_tool_and_update_history(
-                tool_name, new_tool_args, metrics=metrics, tool_start=tool_start, query_emb=emb, **kwargs
-            )
-            results[idx] = result
+                for idx in block.original_indices:
+                    results[idx] = block_result
 
-        # Build final results, mark skipped queries
-        final_results = []
-        for i, query in enumerate(query_list):
-            redundant_item = next((q for q in redundant_queries if q["index"] == i), None)
-            if redundant_item:
-                print(f"[REDUNDANCY] Skipping redundant query {i}: '{query[:50]}...'")
-                final_results.append(f"[SKIPPED] Duplicate of query: \"{query}\"")
-                # Do NOT add to history for skip strategy
-            else:
-                final_results.append(results[i])
+            elif block.action == SearchAction.REUSE_CACHE:
+                cached_obs = ""
+                if block.cache_entry:
+                    cached_obs = block.cache_entry.returned_observation
+                cache_msg = f"[CACHE HIT] Reusing cached result for similar query.\n{cached_obs}" if cached_obs else "[CACHE HIT] Reusing cached result."
+                for idx in block.original_indices:
+                    results[idx] = cache_msg
 
-        return "\n=======\n".join(final_results)
-    
-    def _handle_cache_strategy(self, tool_name: str, tool_args: Dict, deduplication_result: Dict,
-                              metrics: Optional[MetricsCollector], tool_start: float, **kwargs) -> str:
-        """
-        Handle cache strategy for redundant queries
+            elif block.action == SearchAction.SKIP_DUPLICATE:
+                for idx in block.original_indices:
+                    results[idx] = f"[SKIPPED] Duplicate query"
 
-        Args:
-            tool_name: Name of the tool
-            tool_args: Tool arguments
-            deduplication_result: Result from _check_query_redundancy
-            metrics: Metrics collector
-            tool_start: Tool start time
+        ordered_results = [results[i] for i in sorted(results.keys())]
+        return "\n=======\n".join(ordered_results)
 
-        Returns:
-            str: Combined results with cached queries
-        """
-        print(f"[REDUNDANCY] Using cache strategy: executing {len(deduplication_result['non_redundant_queries'])} unique queries, using cached results for {len(deduplication_result['redundant_queries'])} redundant queries")
-        redundant_queries = deduplication_result["redundant_queries"]
-        non_redundant = deduplication_result["non_redundant_queries"]
-        query_list = deduplication_result["query_list"]
-        embeddings = deduplication_result["embeddings"]
 
-        # Execute non-redundant queries
-        results = {}
-        for item in non_redundant:
-            idx = item["index"]
-            query = item["query"]
-            emb = item["embedding"]
-
-            new_tool_args = tool_args.copy()
-            new_tool_args["query"] = [query] if len(query_list) > 1 else query
-
-            print(f"[REDUNDANCY] Executing unique query {idx}: '{query[:50]}...'")
-            result = self._call_tool_and_update_history(
-                tool_name, new_tool_args, metrics=metrics, tool_start=tool_start, query_emb=emb, **kwargs
-            )
-            results[idx] = result
-        
-        # Handle redundant queries (use cache)
-        final_results = []
-        for i, (query, emb) in enumerate(zip(query_list, embeddings)):
-            redundant_item = next((q for q in redundant_queries if q["index"] == i), None)
-            if redundant_item:
-                # Find first executed similar query
-                executed_query = self.query_history.find_first_executed_similar_query(
-                    redundant_item["similar_to"]
-                )
-
-                if executed_query:
-                    # Use cached result
-                    cached_result = executed_query["results"]
-                    print(f"[REDUNDANCY] Using cached result for query {i}: '{query[:50]}...' (from: '{executed_query['query'][:50]}...')")
-                    final_results.append(cached_result)
-
-                    # Add to history with is_executed=False
-                    self.query_history.add_query(
-                        query=query,
-                        embedding=emb,
-                        results=cached_result,
-                        success=executed_query["success"],
-                        is_executed=False,
-                        turn_id=self.turn_id
-                    )
-                else:
-                    # No executed similar query found, execute current query
-                    print(f"[REDUNDANCY] No cached result found for query {i}: '{query[:50]}...', executing anyway")
-                    new_tool_args = tool_args.copy()
-                    new_tool_args["query"] = [query] if len(query_list) > 1 else query
-
-                    result = self._call_tool_and_update_history(
-                        tool_name, new_tool_args, metrics=metrics, tool_start=tool_start, query_emb=emb, **kwargs
-                    )
-                    final_results.append(result)
-            else:
-                final_results.append(results[i])
-
-        return "\n=======\n".join(final_results)
-    
-    def _call_tool_and_update_history(self, tool_name: str, tool_args: Dict, metrics: Optional[MetricsCollector] = None,
-                                     tool_start: float = None, query_emb: np.ndarray = None, **kwargs):
-        """
-        Call tool and update query history if it's a search tool
-        
-        Args:
-            tool_name: Name of the tool
-            tool_args: Tool arguments
-            metrics: Metrics collector
-            tool_start: Tool start time (for metrics)
-            query_emb: Query embedding (if already computed)
-            
-        Returns:
-            Tool result
-        """
-        if tool_start is None:
-            tool_start = time.perf_counter()
-        
-        # Call tool
-        if tool_name not in TOOL_MAP:
-            result = f"Error: Tool {tool_name} not found"
-            if metrics:
-                metrics.record_tool_call(
-                    tool_name=tool_name,
-                    success=False,
-                    latency_ms=(time.perf_counter() - tool_start) * 1000.0,
-                    effective_calls=1,
-                    status_code=None,
-                )
-            return result
-        
-        try:
-            tool_args["params"] = tool_args
-            raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
-            
-            if isinstance(raw_result, tuple) and len(raw_result) == 2:
-                result, status_code = raw_result
-            else:
-                result = raw_result
-                status_code = None
-            
-            success = MetricsCollector.infer_tool_success(result)
-            
-            # Update history if it's a search tool
-            if tool_name in MetricsCollector.SEARCH_TOOL_NAMES and self.enable_redundancy_check:
-                query = tool_args.get("query", "")
-                if isinstance(query, list):
-                    query = query[0]
-
-                # Compute embedding if not provided
-                if query_emb is None:
-                    query_emb = self.embedding_client.encode([query])[0]
-
-                # Add to history
-                print(f"[REDUNDANCY] Adding query to history: '{query[:50]}...' (turn_id: {self.turn_id}, success: {success})")
-                self.query_history.add_query(
-                    query=query,
-                    embedding=query_emb,
-                    results=result,
-                    success=success,
-                    is_executed=True,
-                    turn_id=self.turn_id
-                )
-            
-            # Record metrics
-            if metrics:
-                effective_calls = 1
-                if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
-                    query = tool_args.get("query", [])
-                    if isinstance(query, list):
-                        effective_calls = len(query)
-                    elif isinstance(query, str):
-                        effective_calls = 1
-                
-                metrics.record_tool_call(
-                    tool_name=tool_name,
-                    success=success,
-                    latency_ms=(time.perf_counter() - tool_start) * 1000.0,
-                    effective_calls=effective_calls,
-                    status_code=status_code,
-                )
-            
-            return result
-            
-        except Exception as e:
-            result = f"Error: Tool {tool_name} failed with exception: {str(e)}"
-            success = False
-            
-            if metrics:
-                metrics.record_tool_call(
-                    tool_name=tool_name,
-                    success=False,
-                    latency_ms=(time.perf_counter() - tool_start) * 1000.0,
-                    effective_calls=1,
-                    status_code=None,
-                )
-            
-            return result
