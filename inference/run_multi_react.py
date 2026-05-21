@@ -1,6 +1,14 @@
+from dotenv import load_dotenv
+from pathlib import Path
+import os
+
+# Load .env from project root (parent of inference/)
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path, override=True)
+
+
 import argparse
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures
 from tqdm import tqdm
@@ -8,6 +16,7 @@ import threading
 from datetime import datetime
 from react_agent import MultiTurnReactAgent
 from prompt import build_system_prompt
+from prompt_new import build_system_prompt_new
 import time
 import math
 
@@ -49,7 +58,7 @@ if __name__ == "__main__":
         print(f"Error: worker_split ({worker_split}) must be between 1 and total_splits ({total_splits})")
         exit(1)
 
-    model_name = os.getenv("OPENROUTER_MODEL", "openrouter_model")
+    model_name = os.getenv("RESEARCH_MODEL", "openrouter_model")
     model_dir = os.path.join(output_base, model_name)
     dataset_dir = os.path.join(model_dir, args.dataset)
 
@@ -57,7 +66,7 @@ if __name__ == "__main__":
 
     data_filepath = args.data_file if args.data_file else args.dataset
 
-    print(f"Model name: {model_name}")
+    print(f"Research Model name: {model_name}")
     print(f"Input data file: {data_filepath}")
     print(f"Output directory: {dataset_dir}")
     print(f"Number of rollouts: {roll_out_count}")
@@ -168,7 +177,11 @@ if __name__ == "__main__":
         function_list = [t.strip() for t in available_tools_str.split(",") if t.strip()]
         print(f"[DEBUG] AVAILABLE_TOOLS env: '{available_tools_str}'")
         print(f"[DEBUG] function_list: {function_list}")
-        system_prompt = build_system_prompt(function_list)
+        # system_prompt = build_system_prompt(function_list)
+        # Add new prompt
+        use_new_prompt = os.getenv("PROMPT_NEW", "False").lower() in ("true", "1", "yes")
+        print(f"[DEBUG] Use New Prompt env: '{use_new_prompt}")
+        system_prompt = build_system_prompt_new(function_list) if use_new_prompt else build_system_prompt(function_list)
         has_search = '"name": "search"' in system_prompt
         has_aliyun = '"name": "aliyun_search"' in system_prompt
         print(f"[DEBUG] System prompt contains 'search': {has_search}")

@@ -65,6 +65,14 @@ python3 evaluation/evaluate_deepsearch_official.py \
 --judge_prompt browsecomp \
 --num_rounds 1
 
+python3 evaluation/evaluate_deepsearch_official.py \
+--input_folder /home/liuqian/DR/Tongyi/output/GAIA/alibaba/tongyi-deepresearch-30b-a3b/gaia-level2-10-30b-iqs \
+--judge_model dashscope/qwen3.5-plus \
+--judge_prompt gaia \
+--num_rounds 1
+
 # Summerize
 python3 inference/summarize_metrics.py --dataset_dir output/alibaba/tongyi-deepresearch-30b-a3b/bc-zn10-single-turn-redundant-rephase-0.8 --strict
+
+python3 inference/summarize_metrics.py --dataset_dir output/GAIA/alibaba/tongyi-deepresearch-30b-a3b/gaia-level2-10-30b-iqs --strict
 ```

@@ -14,11 +14,18 @@ class MetricsCollector:
         self._model_stats: Dict[str, Dict[str, Any]] = {
             "research_model": self._new_model_bucket(),
             "summary_model": self._new_model_bucket(),
+            "rephrase_model": self._new_model_bucket(),
         }
         self._tool_stats: Dict[str, Dict[str, Any]] = {}
         self._prompt_breakdown: Dict[str, Dict[str, float]] = {
             "research_model": {},
             "summary_model": {},
+            "rephrase_model": {},
+        }
+        self._context_by_source: Dict[str, List[Dict[str, Any]]] = {
+            "research_model": [],
+            "summary_model": [],
+            "rephrase_model": [],
         }
 
     @staticmethod
@@ -32,6 +39,39 @@ class MetricsCollector:
         if hasattr(usage, "dict"):
             return usage.dict()
         return {}
+
+    def record_context_by_source(
+        self,
+        model_group: str,
+        messages: List[Dict[str, Any]],
+        round_num: int,
+    ) -> None:
+        source_tokens: Dict[str, int] = {}
+        for msg in messages:
+            role = str(msg.get("role", ""))
+            content = str(msg.get("content", ""))
+            source = self._get_context_source_label(role=role, content=content)
+            token_count = self._count_tokens(content)
+            source_tokens[source] = source_tokens.get(source, 0) + token_count
+
+        total_tokens = sum(source_tokens.values())
+        if total_tokens == 0:
+            return
+
+        sources_with_stats = {}
+        for source, tokens in source_tokens.items():
+            percentage = (tokens / total_tokens) * 100.0
+            sources_with_stats[source] = {
+                "tokens": tokens,
+                "percentage": round(percentage, 2),
+            }
+
+        bucket = self._context_by_source.setdefault(model_group, [])
+        bucket.append({
+            "round": round_num,
+            "total_tokens": total_tokens,
+            "sources": sources_with_stats,
+        })
 
     def record_model_call(
         self,
@@ -151,6 +191,14 @@ class MetricsCollector:
             for model_group, bucket in self._prompt_breakdown.items()
         }
 
+        context_by_source = {}
+        for model_group, buckets in self._context_by_source.items():
+            if buckets:
+                context_by_source[model_group] = {
+                    "total_calls": len(buckets),
+                    "details": buckets,
+                }
+
         return {
             "model_metrics": model_stats,
             "search_tool_metrics": {
@@ -162,6 +210,7 @@ class MetricsCollector:
                 "aggregated": self._aggregate_tool_buckets(other_tools, "other"),
             },
             "prompt_breakdown": prompt_breakdown,
+            "context_by_source": context_by_source,
         }
 
     @staticmethod
@@ -221,7 +270,11 @@ class MetricsCollector:
             return "System Instruction"
         if role == "user":
             if "<tool_response>" in text:
-                return "Observation"
+                if "Aliyun IQS search" in text or "search" in text:
+                    return "Search Observation"
+                if "The useful information" in text:
+                    return "Visit Observation"
+                return "Other Observation"
             return "User Query"
         if role == "assistant":
             if "<tool_call>" in text:
@@ -230,6 +283,37 @@ class MetricsCollector:
                 return "Report"
             return "Reasoning"
         return "Other"
+
+    def _get_context_source_label(self, role: str, content: str) -> str:
+        text = content.lower()
+        if role == "system":
+            if "tool" in text and ("parameter" in text or "description" in text):
+                return "tool_definition"
+            return "system_instruction"
+        if role == "user":
+            if "<tool_response>" in text:
+                if "Aliyun IQS search" in text or "search" in text:
+                    return "search_observation"
+                if "The useful information" in text:
+                    return "visit_observation"
+                if "<code>" in text and "</code>" in text:
+                    return "python_observation"
+                return "other_observation"
+            return "user_query"
+        if role == "assistant":
+            if "<tool_call>" in text:
+                tool_name_lower = content.lower()
+                if "python" in tool_name_lower:
+                    return "python_tool_call"
+                if any(s in content for s in ["visit", "url"]):
+                    return "visit_tool_call"
+                if any(s in content for s in ["search", "google"]):
+                    return "search_tool_call"
+                return "other_tool_call"
+            if "<answer>" in text:
+                return "final_answer"
+            return "assistant_reasoning"
+        return "other"
 
     def _count_tokens(self, text: str) -> int:
         if not text:

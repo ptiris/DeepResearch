@@ -7,24 +7,6 @@ TOOL_SCHEMAS = {
     "parse_file": '{"type": "function", "function": {"name": "parse_file", "description": "This is a tool that can be used to parse multiple user uploaded local files such as PDF, DOCX, PPTX, TXT, CSV, XLSX, DOC, ZIP, MP4, MP3.", "parameters": {"type": "object", "properties": {"files": {"type": "array", "items": {"type": "string"}, "description": "The file name of the user uploaded local files to be parsed."}}, "required": ["files"]}}}',
 }
 
-FORMAT_GUARD_PROMPT = """
-## ⚠️ FORMAT VIOLATION WARNING
-
-Your previous response failed to parse correctly. Please STRICTLY follow the format below:
-
-### Correct Tool Call Format:
-<tool_call>
-{"name": "tool_name", "arguments": {"param": "value"}}
-</tool_call>
-
-### Common Mistakes to AVOID:
-- Missing <tool_call> opening/closing tags
-- Using single quotes instead of double quotes
-- Nested JSON inside JSON values (forbidden)
-- Missing required arguments
-- Extra text outside <tool_call> tags
-"""
-
 SYSTEM_PROMPT_TEMPLATE = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 # Tools
@@ -35,6 +17,24 @@ You are provided with function signatures within <tools></tools> XML tags:
 <tools>
 {tool_schemas}
 </tools>
+
+## Search Planning Rules
+Before calling a search tool, carefully check whether the new query is semantically similar to queries already issued in the current or previous turns.
+
+- Do not issue multiple queries that ask for the same entity, fact, or evidence using only minor wording changes.
+- If several candidate queries are similar, merge them into one concise query.
+- If two queries target the same intent but different useful evidence sources, make the difference explicit, such as adding the source type, language, date, or authority.
+- Prefer fewer high-quality, complementary queries over many overlapping queries.
+- Do not sacrifice necessary evidence gathering. If similar-looking queries target genuinely different evidence needs, keep them.
+
+Example:
+Bad:
+["software release date", "when was software released", "software first release"]
+
+Better:
+["software official release notes first release date"]
+
+If similar-looking queries target genuinely different evidence needs, keep them and make the difference explicit.
 
 ## Important Format Rules
 
@@ -100,7 +100,7 @@ Query 2: {q2}
 """
 
 
-def build_system_prompt(available_tools):
+def build_system_prompt_new(available_tools):
     """Build system prompt with only the specified available tools."""
     schemas = [TOOL_SCHEMAS[t] for t in available_tools if t in TOOL_SCHEMAS]
     tool_schemas_str = "\n".join(schemas)

@@ -7,12 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ITER_FILE_PATTERN = re.compile(r"^iter(?P<iter>\d+)(?:_split(?P<split>\d+)of(?P<total>\d+))?\.jsonl$")
 
-MODEL_GROUPS = ["research_model", "summary_model"]
+MODEL_GROUPS = ["research_model", "summary_model", "rephrase_model"]
 EXPECTED_TOP_LEVEL_METRIC_KEYS = {
     "model_metrics",
     "search_tool_metrics",
     "other_tool_metrics",
     "prompt_breakdown",
+    "context_by_source",
 }
 
 
@@ -150,6 +151,25 @@ def update_prompt_breakdown(
             target_group[category] = target_group.get(category, 0) + token_value
 
 
+def update_context_by_source(
+    aggregator: Dict[str, Dict[str, Any]],
+    context_by_source: Dict[str, Any],
+    stats: Dict[str, int],
+) -> None:
+    if not isinstance(context_by_source, dict):
+        return
+
+    for group in MODEL_GROUPS:
+        source_group = context_by_source.get(group, {})
+        if not source_group or not isinstance(source_group, dict):
+            continue
+
+        target = aggregator.setdefault(group, {"details": []})
+        details = source_group.get("details", [])
+        if isinstance(details, list):
+            target["details"].extend(details)
+
+
 def finalize_model_metrics(raw: Dict[str, Any]) -> Dict[str, Any]:
     output: Dict[str, Any] = {}
     for group, bucket in raw.items():
@@ -257,6 +277,40 @@ def finalize_prompt_breakdown(raw: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
     return output
 
 
+def finalize_context_by_source(raw: Dict[str, Any]) -> Dict[str, Any]:
+    output: Dict[str, Any] = {}
+    for group, data in raw.items():
+        if not data or not isinstance(data, dict):
+            continue
+        details = data.get("details", [])
+        if not details:
+            continue
+
+        total_calls = safe_int(data.get("total_calls", 0))
+        all_sources: Dict[str, Dict[str, Any]] = {}
+
+        for detail in details:
+            sources = detail.get("sources", {})
+            for source, stats in sources.items():
+                if source not in all_sources:
+                    all_sources[source] = {"tokens": 0, "call_count": 0}
+                all_sources[source]["tokens"] += safe_int(stats.get("tokens", 0))
+                all_sources[source]["call_count"] += 1
+
+        total_tokens = sum(v["tokens"] for v in all_sources.values())
+        for source in all_sources:
+            tokens = all_sources[source]["tokens"]
+            percentage = (tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0
+            all_sources[source]["percentage"] = round(percentage, 2)
+
+        output[group] = {
+            "total_calls": total_calls,
+            "total_tokens": total_tokens,
+            "sources": all_sources,
+        }
+    return output
+
+
 def summarize_dataset(dataset_dir: str, strict: bool = False) -> Dict[str, Any]:
     warnings: List[str] = []
     source_files = list_metric_result_files(dataset_dir)
@@ -268,6 +322,7 @@ def summarize_dataset(dataset_dir: str, strict: bool = False) -> Dict[str, Any]:
     raw_search_tool_metrics: Dict[str, Dict[str, Any]] = {}
     raw_other_tool_metrics: Dict[str, Dict[str, Any]] = {}
     raw_prompt_breakdown = {group: {} for group in MODEL_GROUPS}
+    raw_context_by_source: Dict[str, Dict[str, Any]] = {group: {"details": []} for group in MODEL_GROUPS}
 
     stats = {
         "total_lines": 0,
@@ -335,6 +390,7 @@ def summarize_dataset(dataset_dir: str, strict: bool = False) -> Dict[str, Any]:
                     stats=stats,
                 )
                 update_prompt_breakdown(raw_prompt_breakdown, metrics.get("prompt_breakdown", {}), stats)
+                update_context_by_source(raw_context_by_source, metrics.get("context_by_source", {}), stats)
 
                 stats["valid_metric_samples"] += 1
 
@@ -346,6 +402,7 @@ def summarize_dataset(dataset_dir: str, strict: bool = False) -> Dict[str, Any]:
         "search_tool_metrics": finalize_tool_buckets(raw_search_tool_metrics, category="search"),
         "other_tool_metrics": finalize_tool_buckets(raw_other_tool_metrics, category="other"),
         "prompt_breakdown": finalize_prompt_breakdown(raw_prompt_breakdown),
+        "context_by_source": finalize_context_by_source(raw_context_by_source),
     }
 
     return {

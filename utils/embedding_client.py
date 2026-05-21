@@ -8,16 +8,38 @@ from openai import OpenAI
 import os
 import time
 
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-DASHSCOPE_BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+# 使用统一的 provider 配置
+_EMBEDDING_PROVIDER = os.getenv('EMBEDDING_PROVIDER', os.getenv('PROVIDER', 'dashscope'))
+
+_PROVIDER_API_CONFIGS = {
+    'openrouter': {
+        'api_key_env': 'OPENROUTER_API_KEY',
+        'base_url_env': 'OPENROUTER_BASE_URL',
+        'base_url_default': 'https://openrouter.ai/api/v1',
+    },
+    'dashscope': {
+        'api_key_env': 'DASHSCOPE_API_KEY',
+        'base_url_env': 'DASHSCOPE_BASE_URL',
+        'base_url_default': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    },
+    'openai': {
+        'api_key_env': 'OPENAI_API_KEY',
+        'base_url_env': 'OPENAI_API_BASE',
+        'base_url_default': 'https://api.openai.com/v1',
+    },
+}
+
+_config = _PROVIDER_API_CONFIGS.get(_EMBEDDING_PROVIDER, _PROVIDER_API_CONFIGS['dashscope'])
+API_KEY = os.getenv(_config['api_key_env'], '')
+BASE_URL = os.getenv(_config['base_url_env'], _config['base_url_default'])
 EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_DIM = 1024
 
 
 def get_client():
     return OpenAI(
-        api_key=DASHSCOPE_API_KEY,
-        base_url=DASHSCOPE_BASE_URL,
+        api_key=API_KEY,
+        base_url=BASE_URL,
     )
 
 

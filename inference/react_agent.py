@@ -1,6 +1,7 @@
 import json
 import json5
 import os
+import re
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
@@ -17,6 +18,7 @@ import time
 import asyncio
 import numpy as np
 from metrics import MetricsCollector
+from model_client import ModelClient
 
 from tool_file import *
 from tool_scholar import *
@@ -84,23 +86,13 @@ class MultiTurnReactAgent(FnCallAgent):
         self.query_history = None
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
-        provider = os.getenv('PROVIDER')
-        if (provider == 'openrouter'):
-            openai_api_key = os.getenv("OPENROUTER_API_KEY", "")
-            openai_api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-            model = os.getenv("OPENROUTER_MODEL", "")
-        elif(provider == 'dashscope'):
-            openai_api_key = os.getenv("DASHSCOPE_API_KEY", "")
-            openai_api_base = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
-            model = os.getenv("DASHSCOPE_MODEL", "")
-        if not openai_api_key:
-            return "Error: OPENROUTER_API_KEY not set in environment"
+        model_client = ModelClient('research')
+        provider = model_client.provider
+        model = model_client.model
+        if not model_client.api_key:
+            return "Error: API_KEY not set in environment"
 
-        client = OpenAI(
-            api_key=openai_api_key,
-            base_url=openai_api_base,
-            timeout=600.0,
-        )
+        client = model_client.get_client()
 
         base_sleep_time = 1
         for attempt in range(max_tries):
@@ -153,7 +145,39 @@ class MultiTurnReactAgent(FnCallAgent):
                             usage=usage,
                         )
 
-            except (APIError, APIConnectionError, APITimeoutError) as e:
+            except APIError as e:
+                # Check if it's a context length error (400 with max context length message) - non-retryable
+                error_msg = ''
+                try:
+                    if hasattr(e, 'response') and e.response is not None:
+                        error_body = e.response.json()
+                        error_msg = error_body.get('error', {}).get('message', '')
+                        error_code = error_body.get('error', {}).get('code', '')
+                        if (error_code == 400 or 'maximum context length' in error_msg.lower()) and 'context length' in error_msg.lower():
+                            print(f"Error: Context length exceeded (non-retryable): {e}")
+                            if metrics:
+                                metrics.record_model_call(
+                                    model_group="research_model",
+                                    success=False,
+                                    latency_ms=(time.perf_counter() - call_start) * 1000.0,
+                                    usage=None,
+                                )
+                            return {
+                                "content": f"Error: Context length exceeded - {error_msg}",
+                                "usage": None,
+                            }
+                except:
+                    pass
+                # Fall through to normal retry handling for other APIErrors
+                print(f"Error: Attempt {attempt + 1} failed with an API error: {e}")
+                if metrics:
+                    metrics.record_model_call(
+                        model_group="research_model",
+                        success=False,
+                        latency_ms=(time.perf_counter() - call_start) * 1000.0,
+                        usage=None,
+                    )
+            except (APIConnectionError, APITimeoutError) as e:
                 print(f"Error: Attempt {attempt + 1} failed with an API or network error: {e}")
                 if metrics:
                     metrics.record_model_call(
@@ -214,6 +238,7 @@ class MultiTurnReactAgent(FnCallAgent):
             print(f"[REDUNDANCY] Redundancy check is disabled")
         self.turn_id = 0
         rephase_retry_count = 0
+        json_retry_count = 0
         
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
@@ -231,6 +256,11 @@ class MultiTurnReactAgent(FnCallAgent):
                 return result
             round += 1
             num_llm_calls_available -= 1
+            metrics.record_context_by_source(
+                model_group="research_model",
+                messages=messages,
+                round_num=round,
+            )
             model_response = self.call_server(messages, metrics=metrics)
             content = model_response.get("content", "")
             print(f'Round {round}: {content}')
@@ -238,7 +268,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 pos = content.find('<tool_response>')
                 content = content[:pos]
             messages.append({"role": "assistant", "content": content.strip()})
+            action_found = False
             if '<tool_call>' in content and '</tool_call>' in content:
+                action_found = True
                 tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
                 try:
                     if "python" in tool_call.lower():
@@ -248,9 +280,46 @@ class MultiTurnReactAgent(FnCallAgent):
                         except:
                             result = "[Python Interpreter Error]: Formatting error."
                     else:
-                        tool_call = json5.loads(tool_call)
-                        tool_name = tool_call.get('name', '')
-                        tool_args = tool_call.get('arguments', {})
+                        tool_name = None
+                        tool_args = None
+                        
+                        # 检测 XML 属性格式: <tool_call name="search">
+                        xml_attr_match = re.search(r'<tool_call\s+name="([^"]+)"', content)
+                        if xml_attr_match:
+                            tool_name = xml_attr_match.group(1)
+                            json_match = re.search(r'<tool_call[^>]*>([\s\S]+?)</tool_call>', content)
+                            if json_match:
+                                try:
+                                    inner_json = json5.loads(json_match.group(1))
+                                    tool_args = inner_json.get('arguments', inner_json)
+                                    print(f"[TOOL_CALL_PARSE] XML attribute format detected")
+                                    print(f"[TOOL_CALL_PARSE]   tool_name: {tool_name}")
+                                    print(f"[TOOL_CALL_PARSE]   tool_args: {str(tool_args)[:100]}...")
+                                except Exception as e:
+                                    print(f"[TOOL_CALL_PARSE] XML format JSON parse failed: {e}")
+                                    tool_args = None
+                        else:
+                            # 标准 JSON 格式
+                            try:
+                                tool_call_json = json5.loads(tool_call)
+                                tool_name = tool_call_json.get('name', '')
+                                tool_args = tool_call_json.get('arguments', {})
+                                print(f"[TOOL_CALL_PARSE] Standard JSON format detected")
+                                print(f"[TOOL_CALL_PARSE]   tool_name: {tool_name}")
+                                print(f"[TOOL_CALL_PARSE]   tool_args: {str(tool_args)[:100]}...")
+                            except Exception as e:
+                                print(f"[TOOL_CALL_PARSE] JSON parse failed: {e}")
+                                tool_name = None
+                                tool_args = None
+                        
+                        # 验证工具调用参数合法性，不合法则触发重试
+                        if not tool_name or tool_args is None:
+                            raise ValueError(
+                                f"Invalid tool_call: cannot extract valid tool_name and arguments. "
+                                f"tool_name={tool_name}, tool_args={tool_args}. "
+                                f"Please use format: <tool_call>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tool_call>"
+                            )
+                        
                         result = self.custom_call_tool(tool_name, tool_args, _metrics=metrics)
                         
                         # Check if result contains REDUNDANT_REPHASE marker
@@ -275,15 +344,60 @@ class MultiTurnReactAgent(FnCallAgent):
                             else:
                                 print(f"[REDUNDANCY] Max retries ({self.redundancy_max_retries}) exceeded, proceeding with execution")
                                 # Proceed with current result (will be added to messages below)
-                except:
-                    result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
+                except Exception as e:
+                    max_json_retries = 5
+                    if json_retry_count < max_json_retries:
+                        json_retry_count += 1
+                        print(f"[TOOL_CALL_PARSE] JSON parse FAILED")
+                        print(f"[TOOL_CALL_PARSE]   Attempt: {json_retry_count}/{max_json_retries}")
+                        print(f"[TOOL_CALL_PARSE]   Error: {e}")
+                        print(f"[TOOL_CALL_PARSE]   Content preview: {tool_call[:200]}...")
+                        messages.append({"role": "user", "content": FORMAT_GUARD_PROMPT})
+                        num_llm_calls_available += 1
+                        round -= 1
+                        continue
+                    else:
+                        print(f"[TOOL_CALL_PARSE] Max retries ({max_json_retries}) exceeded")
+                        print(f"[TOOL_CALL_PARSE]   Error: {e}")
+                        print(f"[TOOL_CALL_PARSE]   Content: {tool_call[:200]}...")
+                        print(f"[TOOL_CALL_PARSE]   Continuing with error info in context...")
+                        error_context = (
+                            f"ERROR: Tool call parse failed after {max_json_retries} retries.\n"
+                            f"Parse error: {str(e)}\n"
+                            f"Invalid content: {tool_call[:500]}...\n"
+                            f"Please use correct <tool_call> format with valid JSON."
+                        )
+                        messages.append({"role": "user", "content": error_context})
+                        result = f'Parse failed after {max_json_retries} retries'
                 result = "<tool_response>\n" + result + "\n</tool_response>"
                 messages.append({"role": "user", "content": result})
             if '<answer>' in content and '</answer>' in content:
                 termination = 'answer'
+                action_found = True
                 break
             if num_llm_calls_available <= 0 and '<answer>' not in content:
+                action_found = True
                 messages[-1]['content'] = 'Sorry, the number of llm calls exceeds the limit.'
+            if action_found == False and num_llm_calls_available > 0:
+                if self.is_context_length_error(content):
+                    print("[CONTEXT_OVERFLOW] Context length exceeded. Stop this task.")
+                    prediction = "No answer found."
+                    termination = "context_length_exceeded"
+                    result = {
+                        "question": question,
+                        "answer": answer,
+                        "messages": messages,
+                        "prediction": prediction,
+                        "termination": termination,
+                        "metrics": metrics.to_dict(),
+                    }
+                    return result
+                print(f"[TOOL_CALL_PARSE] No valid tool_call or answer found in response")
+                print(f"[TOOL_CALL_PARSE] Content preview: {content[:200]}...")
+                messages.append({"role": "user", "content": FORMAT_GUARD_PROMPT})
+                round -= 1
+                continue
+
 
         if '<answer>' in messages[-1]['content']:
             prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
@@ -302,6 +416,14 @@ class MultiTurnReactAgent(FnCallAgent):
             "metrics": metrics.to_dict(),
         }
         return result
+
+    def is_context_length_error(self, text: str) -> bool:
+        s = str(text).lower()
+        return (
+            "context length exceeded" in s
+            or "maximum context length" in s
+            or ("requested about" in s and "tokens" in s)
+        )
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
         if tool_name == "search" and "search" not in self._function_list and "aliyun_search" in self._function_list:
@@ -332,7 +454,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 if deduplication_result["has_redundant"]:
                     # Handle based on strategy
                     if self.redundancy_strategy == "rephase":
-                        merged_result = self._handle_rephase_strategy(deduplication_result)
+                        merged_result = self._handle_rephase_strategy(deduplication_result, metrics)
                         if isinstance(merged_result, list):
                             print(f"[REDUNDANCY] Executing merged queries: {merged_result}")
                             new_tool_args = tool_args.copy()
@@ -350,6 +472,9 @@ class MultiTurnReactAgent(FnCallAgent):
                         result = self._call_tool_and_update_history(tool_name, tool_args, metrics=metrics, tool_start=tool_start, **kwargs)
 
                     return result
+        else:
+            if tool_name in MetricsCollector.SEARCH_TOOL_NAMES:
+                print(f"[REDUNDANCY] Skipped: enable_redundancy_check={self.enable_redundancy_check} (search tool '{tool_name}' called without redundancy check)")
         
         if tool_name in TOOL_MAP:
             print(f"[DEBUG] custom_call_tool invoked with tool_name: '{tool_name}', args: {tool_args}")
@@ -433,11 +558,16 @@ class MultiTurnReactAgent(FnCallAgent):
         seen_representative_queries = []  # List of (query_text, embedding) that are already kept
 
         for i, (query, emb) in enumerate(zip(query_list, embeddings)):
+            print(f"\n[REDUNDANCY] === Checking query {i}: '{query[:60]}' ===")
             if self.redundancy_scope == "single_turn":
                 # Check against previously kept queries in current turn
                 sim_queries = []
+                if not seen_representative_queries:
+                    print(f"[REDUNDANCY]   No history to compare (first query in this turn)")
                 for rep_text, rep_emb in seen_representative_queries:
                     sim = self.embedding_client.similarity(emb, rep_emb)
+                    status = "REDUNDANT" if sim >= self.redundancy_similarity_threshold else "unique"
+                    print(f"[REDUNDANCY]   vs '{rep_text[:50]}' -> sim={sim:.4f} (threshold={self.redundancy_similarity_threshold}) => {status}")
                     if sim >= self.redundancy_similarity_threshold:
                         sim_queries.append({
                             "query": rep_text,
@@ -447,6 +577,8 @@ class MultiTurnReactAgent(FnCallAgent):
                         })
             else:  # global
                 # Compare with all historical queries
+                history_size = self.query_history.get_history_size()
+                print(f"[REDUNDANCY]   Global scope: comparing against {history_size} historical queries")
                 sim_queries = self.query_history.find_similar_queries(
                     emb,
                     self.redundancy_similarity_threshold,
@@ -454,9 +586,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
 
             if sim_queries:
-                print(f"[REDUNDANCY] Query {i}: '{query[:50]}...' is redundant (found {len(sim_queries)} similar query/queries)")
+                print(f"[REDUNDANCY] Query {i}: '{query[:60]}' => REDUNDANT (found {len(sim_queries)} similar)")
                 for sim_query in sim_queries:
-                    print(f"[REDUNDANCY]   Similar to: '{sim_query['query'][:50]}...' (similarity: {sim_query['similarity']:.4f})")
+                    print(f"[REDUNDANCY]   Similar to: '{sim_query['query'][:50]}' (sim={sim_query['similarity']:.4f})")
                 redundant_queries.append({
                     "index": i,
                     "query": query,
@@ -481,59 +613,78 @@ class MultiTurnReactAgent(FnCallAgent):
             "embeddings": embeddings
         }
     
-    def _merge_queries_with_rephrase(self, q1: str, q2: str) -> str:
+    def _merge_queries_with_rephrase(self, q1: str, q2: str, metrics: Optional[MetricsCollector] = None) -> str:
         """
         Merge two queries using the rephrase model and REPHASE_PROMPT.
 
         Args:
             q1: First query
             q2: Second query
+            metrics: Metrics collector
 
         Returns:
             str: Merged query
-        """
-        rephrase_model = os.getenv("REPHASE_MODEL", "")
-        if not rephrase_model:
+"""
+        import time
+        rephrase_client = ModelClient('rephrase')
+        if not rephrase_client.model:
             print("[REDUNDANCY] REPHASE_MODEL not set, returning q2 unchanged")
             return q2
-
-        prompt_content = REPHASE_PROMPT.format(q1=q1, q2=q2)
-
-        provider = os.getenv('PROVIDER', 'openrouter')
-        if provider == 'openrouter':
-            api_key = os.getenv("OPENROUTER_API_KEY", "")
-            api_base = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-        elif provider == 'dashscope':
-            api_key = os.getenv("DASHSCOPE_API_KEY", "")
-            api_base = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
-        else:
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-
-        if not api_key:
+        if not rephrase_client.api_key:
             print("[REDUNDANCY] No API key available, returning q2 unchanged")
             return q2
 
-        client = OpenAI(api_key=api_key, base_url=api_base, timeout=60.0)
+        prompt_content = REPHASE_PROMPT.format(q1=q1, q2=q2)
+        client = rephrase_client.get_client()
 
         messages = [{"role": "user", "content": prompt_content}]
 
+        start_time = time.time()
         try:
-            print(f"[REDUNDANCY] Calling rephrase model: {rephrase_model}")
+            print(f"[REDUNDANCY] Calling rephrase model: {rephrase_client.model}")
             chat_response = client.chat.completions.create(
-                model=rephrase_model,
+                model=rephrase_client.model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=256,
+                max_tokens=40960,
             )
-            merged_query = chat_response.choices[0].message.content.strip()
+            latency_ms = (time.time() - start_time) * 1000
+            content = chat_response.choices[0].message.content
+            if content is None:
+                content = chat_response.choices[0].message.reasoning
+            merged_query = content.strip()
             print(f"[REDUNDANCY] Merged '{q1}' + '{q2}' -> '{merged_query}'")
+
+            if metrics:
+                usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
+                metrics.record_model_call(
+                    model_group="rephrase_model",
+                    success=True,
+                    latency_ms=latency_ms,
+                    usage=usage,
+                )
+                metrics.record_prompt_breakdown(
+                    model_group="rephrase_model",
+                    messages=messages,
+                    usage=usage,
+                )
+
             return merged_query
         except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
             print(f"[REDUNDANCY] Error calling rephrase model: {e}, returning q2 unchanged")
+
+            if metrics:
+                metrics.record_model_call(
+                    model_group="rephrase_model",
+                    success=False,
+                    latency_ms=latency_ms,
+                    usage=None,
+                )
+
             return q2
 
-    def _handle_rephase_strategy(self, deduplication_result: Dict) -> str:
+    def _handle_rephase_strategy(self, deduplication_result: Dict, metrics: Optional[MetricsCollector] = None) -> str:
         """
         Handle rephase strategy for redundant queries.
 
@@ -542,6 +693,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
         Args:
             deduplication_result: Result from _check_query_redundancy
+            metrics: Metrics collector
 
         Returns:
             str: Merged query list or feedback message
@@ -568,7 +720,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 if sim >= self.redundancy_similarity_threshold:
                     rep_query = processed_queries[j]
                     print(f"[REDUNDANCY] Query '{query}' is similar to '{rep_query}' (similarity: {sim:.4f}), merging")
-                    merged_query = self._merge_queries_with_rephrase(rep_query, query)
+                    merged_query = self._merge_queries_with_rephrase(rep_query, query, metrics)
                     processed_queries.pop(j)
                     processed_embeddings.pop(j)
                     merged_emb = self.embedding_client.encode([merged_query])[0]

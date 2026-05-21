@@ -20,7 +20,6 @@ if [ -z "$OPENROUTER_API_KEY" ]; then
     exit 1
 fi
 
-echo "OPENROUTER_MODEL: $OPENROUTER_MODEL"
 echo "Starting inference..."
 
 cd "$( dirname -- "${BASH_SOURCE[0]}" )"

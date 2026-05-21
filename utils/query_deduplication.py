@@ -71,8 +71,10 @@ class QueryHistory:
                         })
         else:
             # 与所有历史查询比较（global scope）
-            for entry in self.history:
+            for idx, entry in enumerate(self.history):
                 sim = self.embedding_client.similarity(query_embedding, entry["embedding"])
+                status = "REDUNDANT" if sim >= threshold else "unique"
+                print(f"[REDUNDANCY]   [{idx}] '{entry['query'][:50]}' -> sim={sim:.4f} (threshold={threshold}) => {status}")
                 if sim >= threshold:
                     similar_queries.append({
                         "query": entry["query"],

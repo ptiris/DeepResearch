@@ -1,0 +1,22 @@
+print(f"[REDUNDANCY] Merged query list: {processed_queries}")
+
+        if len(processed_queries) == 1:
+            return processed_queries[0]
+        return processed_queries
+
+    def _handle_skip_strategy(self, tool_name: str, tool_args: Dict, deduplication_result: Dict,
+                             metrics: Optional[MetricsCollector], tool_start: float, **kwargs) -> str:
+        """
+        Handle skip strategy for redundant queries
+
+        Args:
+            tool_name: Name of the tool
+            tool_args: Tool arguments
+            deduplication_result: Result from _check_query_redundancy
+            metrics: Metrics collector
+            tool_start: Tool start time
+
+        Returns:
+            str: Combined results with skipped queries marked
+        """
+        print(f"[REDUNDANCY] Using skip strategy: executing {len(deduplication_result['non_redundant_queries'])} unique queries, skipping {len(deduplication_result['redundant_queries'])} redundant queries")

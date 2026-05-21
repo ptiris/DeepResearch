@@ -14,6 +14,7 @@ import time
 from transformers import AutoTokenizer
 import tiktoken
 from metrics import MetricsCollector
+from model_client import ModelClient
 
 VISIT_SERVER_TIMEOUT = int(os.getenv("VISIT_SERVER_TIMEOUT", 200))
 WEBCONTENT_MAXLENGTH = int(os.getenv("WEBCONTENT_MAXLENGTH", 150000))
@@ -100,18 +101,19 @@ class Visit(BaseTool):
         return response.strip()
         
     def call_server(self, msgs, max_retries=2, _metrics: Optional[MetricsCollector] = None):
-        api_key = os.environ.get("API_KEY")
-        url_llm = os.environ.get("API_BASE")
-        model_name = os.environ.get("SUMMARY_MODEL_NAME", "")
-        client = OpenAI(
-            api_key=api_key,
-            base_url=url_llm,
-        )
+        summary_client = ModelClient('summary')
+        if not summary_client.api_key:
+            print("Warning: SUMMARY_API_KEY not set, using API_KEY as fallback")
+            summary_client.api_key = os.environ.get("API_KEY", "")
+            summary_client.base_url = os.environ.get("API_BASE", summary_client.base_url)
+        if not summary_client.model:
+            summary_client.model = os.environ.get("SUMMARY_MODEL_NAME", "")
+        client = summary_client.get_client()
         for attempt in range(max_retries):
             call_start = time.perf_counter()
             try:
                 chat_response = client.chat.completions.create(
-                    model=model_name,
+                    model=summary_client.model,
                     messages=msgs,
                     temperature=0.7
                 )
