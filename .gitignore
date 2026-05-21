@@ -157,3 +157,7 @@ output/
 # soft links
 example_calc.py
 example_pricing.py
+
+# extra source code
+Agent/
+.ruff_cache/
