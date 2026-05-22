@@ -511,13 +511,13 @@ class MultiTurnReactAgent(FnCallAgent):
 
         decision = self.search_controller.pre_search(request, self.controller_state)
 
-        block_results = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
+        block_results, block_latencies = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
 
         if self.query_logger is not None:
             self._log_query_processing(request.task_id, request.turn_id, query_list, decision, block_results)
 
-        for block, result_str in zip(decision.query_blocks, block_results):
-            entry = self._build_memory_entry(tool_name, block, result_str, request)
+        for block, result_str, latency in zip(decision.query_blocks, block_results, block_latencies):
+            entry = self._build_memory_entry(tool_name, block, result_str, request, latency)
             self.search_controller.update_memory(entry, self.controller_state)
 
         return "\n=======\n".join(block_results)
@@ -564,10 +564,12 @@ class MultiTurnReactAgent(FnCallAgent):
         metrics: Optional[MetricsCollector],
         tool_start: float,
         **kwargs,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[float]]:
         block_results = []
+        block_latencies = []
 
         for block in decision.query_blocks:
+            block_start = time.perf_counter()
             if block.action == SearchAction.EXECUTE or block.action == SearchAction.REDUCE_TOPK:
                 block_args = tool_args.copy()
                 block_args["query"] = block.queries
@@ -580,6 +582,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 except Exception as e:
                     block_result = f"Error: Search query failed: {str(e)}"
                 block_results.append(block_result)
+                block_latencies.append((time.perf_counter() - block_start) * 1000.0)
 
             elif block.action == SearchAction.MERGE:
                 merged_query = self._merge_queries(block.queries, metrics)
@@ -595,6 +598,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 except Exception as e:
                     block_result = f"Error: Merged search query failed: {str(e)}"
                 block_results.append(block_result)
+                block_latencies.append((time.perf_counter() - block_start) * 1000.0)
 
             elif block.action == SearchAction.REUSE_CACHE:
                 cached_obs = ""
@@ -604,11 +608,13 @@ class MultiTurnReactAgent(FnCallAgent):
                     cache_msg = "Error: Empty cache entry found"
                 cache_msg = f"[CACHE HIT] Reusing cached result for similar query.\n{cached_obs}" if cached_obs else "[CACHE HIT] Reusing cached result."
                 block_results.append(cache_msg)
+                block_latencies.append(0.0)
 
             elif block.action == SearchAction.SKIP_DUPLICATE:
                 block_results.append("[SKIPPED] Duplicate query")
+                block_latencies.append(0.0)
 
-        return block_results
+        return block_results, block_latencies
 
     def _build_memory_entry(
         self,
@@ -616,6 +622,7 @@ class MultiTurnReactAgent(FnCallAgent):
         block: QueryBlock,
         result_str: str,
         request: SearchRequest,
+        latency_ms: float = 0.0,
     ) -> SearchMemoryEntry:
         url_list = self._extract_urls(result_str)
         raw_tokens = self._count_tokens(result_str)
@@ -648,7 +655,7 @@ class MultiTurnReactAgent(FnCallAgent):
             url_list=url_list,
             raw_observation_tokens=raw_tokens,
             returned_observation_tokens=raw_tokens,
-            latency_ms=0.0,
+            latency_ms=latency_ms,
         )
 
     def _extract_urls(self, result: str) -> list[str]:
