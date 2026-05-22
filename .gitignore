@@ -161,3 +161,4 @@ example_pricing.py
 # extra source code
 Agent/
 .ruff_cache/
+.vscode/

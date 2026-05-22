@@ -75,7 +75,7 @@ def encode_texts(texts, batch_size=6):
             )
             for item in resp.data:
                 all_embs.append(item.embedding)
-            print(f"[Embedding] encoded: {end}/{len(texts)}", flush=True)
+            # print(f"[Embedding] encoded: {end}/{len(texts)}", flush=True)
             
             if end < len(texts):
                 time.sleep(0.1)

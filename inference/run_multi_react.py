@@ -6,7 +6,6 @@ import os
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path, override=True)
 
-
 import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -171,6 +170,7 @@ if __name__ == "__main__":
             function_list=function_list,
             system_prompt=system_prompt,
         )
+        test_agent.set_query_logger(dataset_dir)
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}
 

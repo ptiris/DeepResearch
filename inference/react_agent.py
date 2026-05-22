@@ -17,11 +17,12 @@ from prompt import *
 import time
 import asyncio
 import numpy as np
-from metrics import MetricsCollector
+from metrics import MetricsCollector, QueryProcessLogger
 from model_client import ModelClient
 from search_controller import (
     SearchController, SearchRequest, ControllerState, SearchMemory,
-    BudgetState, ContextProfile, SearchAction, SearchMemoryEntry, PreSearchDecision
+    BudgetState, ContextProfile, SearchAction, SearchMemoryEntry, PreSearchDecision,
+    QueryBlock, ToolStatus
 )
 
 from tool_file import *
@@ -81,7 +82,7 @@ class MultiTurnReactAgent(FnCallAgent):
             context_profile=ContextProfile(
                 policy="append_history",
                 replay_factor=2.0,
-                admission_policy="budgeted",
+                admission_policy="pass_through",
                 cache_replay_policy="pointer",
             ),
         )
@@ -94,7 +95,11 @@ class MultiTurnReactAgent(FnCallAgent):
             ),
         )
         self.turn_id = 0
-        
+        self.query_logger: Optional[QueryProcessLogger] = None
+
+    def set_query_logger(self, output_dir: str):
+        log_path = os.path.join(output_dir, "query_process_log.jsonl")
+        self.query_logger = QueryProcessLogger(log_path)
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
         model_client = ModelClient('research')
@@ -217,7 +222,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 print("Error: All retry attempts have been exhausted. The call has failed.")
 
         return {
-            f"content": "{privider} error!!!",
+            f"content": "{provider} error!!!",
             "usage": None,
         }
 
@@ -428,9 +433,6 @@ class MultiTurnReactAgent(FnCallAgent):
         # ========== Branch B: Non-search tools → Original dispatch ==========
         if tool_name in TOOL_MAP:
             print(f"[DEBUG] custom_call_tool invoked with tool_name: '{tool_name}', args: {tool_args}")
-            if tool_name == "search" and "search" not in self._function_list and "aliyun_search" in self._function_list:
-                print(f"[DEBUG] Remapping 'search' to 'aliyun_search' (Serper not available, using Aliyun IQS)")
-                tool_name = "aliyun_search"
             tool_args["params"] = tool_args
             try:
                 if "python" in tool_name.lower():
@@ -509,32 +511,50 @@ class MultiTurnReactAgent(FnCallAgent):
 
         decision = self.search_controller.pre_search(request, self.controller_state)
 
-        result = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
+        block_results = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
 
-        # ============ START TODO: post_search - update controller memory pool ============
-        # For each executed QueryBlock (EXECUTE / REDUCE_TOPK / MERGE):
-        #   1. Parse raw_result → url_list, domain_list, title_snippet_list, token counts
-        #   2. Create SearchMemoryEntry with:
-        #      - query, query_embedding, turn_id, tool_name, search_engine
-        #      - action (from block.action), executed_external_api=True
-        #      - tool_status (infer from result: SUCCESS_NONEMPTY / EMPTY / FAILED)
-        #      - raw_result, returned_observation, url_list
-        #      - raw_observation_tokens, returned_observation_tokens, latency_ms
-        #   3. self.controller_state.memory.add(entry)
-        #
-        # For REUSE_CACHE blocks:
-        #   - entry.executed_external_api = False
-        #   - entry.tool_status = CACHED
-        #   - No duplicate memory entry needed (cache already exists in memory)
-        #
-        # Update BudgetState:
-        #   - self.controller_state.budget_state.effective_search_calls += n_executed
-        #   - self.controller_state.budget_state.observation_tokens_used += len(result_tokens)
-        #
-        # self.search_controller.post_search(request, result, self.controller_state)
-        # ============ END TODO ============
+        if self.query_logger is not None:
+            self._log_query_processing(request.task_id, request.turn_id, query_list, decision, block_results)
 
-        return result
+        for block, result_str in zip(decision.query_blocks, block_results):
+            entry = self._build_memory_entry(tool_name, block, result_str, request)
+            self.search_controller.update_memory(entry, self.controller_state)
+
+        return "\n=======\n".join(block_results)
+
+    def _log_query_processing(
+        self,
+        task_id: str,
+        turn_id: int,
+        query_list: list[str],
+        decision: PreSearchDecision,
+        block_results: list[str],
+    ):
+        blocks_info = []
+        for block, result_str in zip(decision.query_blocks, block_results):
+            block_info = {
+                "action": block.action.value,
+                "original_queries": block.queries,
+                "success": "Error" not in result_str,
+            }
+            if block.action == SearchAction.MERGE:
+                block_info["merged_query"] = block.merged_query
+            if block.action == SearchAction.REUSE_CACHE and block.cache_entry:
+                block_info["cache_info"] = {
+                    "cached_query": block.cache_entry.query,
+                    "sim": 0.0,
+                    "turn_dist": turn_id - block.cache_entry.turn_id,
+                }
+            blocks_info.append(block_info)
+
+        self.query_logger.record_turn(
+            task_id=task_id,
+            turn_id=turn_id,
+            query_list=query_list,
+            intra_sim=self.search_controller.last_intra_sim,
+            blocks=blocks_info,
+        )
+        self.query_logger.flush()
 
     def _execute_query_blocks(
         self,
@@ -544,11 +564,11 @@ class MultiTurnReactAgent(FnCallAgent):
         metrics: Optional[MetricsCollector],
         tool_start: float,
         **kwargs,
-    ) -> str:
-        results = {}
+    ) -> list[str]:
+        block_results = []
 
         for block in decision.query_blocks:
-            if block.action in (SearchAction.EXECUTE, SearchAction.MERGE, SearchAction.REDUCE_TOPK):
+            if block.action == SearchAction.EXECUTE or block.action == SearchAction.REDUCE_TOPK:
                 block_args = tool_args.copy()
                 block_args["query"] = block.queries
                 try:
@@ -559,23 +579,147 @@ class MultiTurnReactAgent(FnCallAgent):
                         block_result = raw
                 except Exception as e:
                     block_result = f"Error: Search query failed: {str(e)}"
+                block_results.append(block_result)
 
-                for idx in block.original_indices:
-                    results[idx] = block_result
+            elif block.action == SearchAction.MERGE:
+                merged_query = self._merge_queries(block.queries, metrics)
+                block.merged_query = merged_query
+                block_args = tool_args.copy()
+                block_args["query"] = [merged_query]
+                try:
+                    raw = TOOL_MAP[tool_name].call(block_args, **kwargs)
+                    if isinstance(raw, tuple) and len(raw) == 2:
+                        block_result, _ = raw
+                    else:
+                        block_result = raw
+                except Exception as e:
+                    block_result = f"Error: Merged search query failed: {str(e)}"
+                block_results.append(block_result)
 
             elif block.action == SearchAction.REUSE_CACHE:
                 cached_obs = ""
                 if block.cache_entry:
                     cached_obs = block.cache_entry.returned_observation
+                else:
+                    cache_msg = "Error: Empty cache entry found"
                 cache_msg = f"[CACHE HIT] Reusing cached result for similar query.\n{cached_obs}" if cached_obs else "[CACHE HIT] Reusing cached result."
-                for idx in block.original_indices:
-                    results[idx] = cache_msg
+                block_results.append(cache_msg)
 
             elif block.action == SearchAction.SKIP_DUPLICATE:
-                for idx in block.original_indices:
-                    results[idx] = f"[SKIPPED] Duplicate query"
+                block_results.append("[SKIPPED] Duplicate query")
 
-        ordered_results = [results[i] for i in sorted(results.keys())]
-        return "\n=======\n".join(ordered_results)
+        return block_results
+
+    def _build_memory_entry(
+        self,
+        tool_name: str,
+        block: QueryBlock,
+        result_str: str,
+        request: SearchRequest,
+    ) -> SearchMemoryEntry:
+        url_list = self._extract_urls(result_str)
+        raw_tokens = self._count_tokens(result_str)
+
+        if block.action == SearchAction.REUSE_CACHE:
+            tool_status = ToolStatus.CACHED
+        elif block.action == SearchAction.SKIP_DUPLICATE:
+            tool_status = ToolStatus.SKIPPED
+        elif "Error" in result_str:
+            tool_status = ToolStatus.FAILED
+        elif not result_str.strip():
+            tool_status = ToolStatus.EMPTY
+        else:
+            tool_status = ToolStatus.SUCCESS_NONEMPTY
+
+        query = block.queries[0] # For block with MERGE , queries[0] stores the merged results.
+        query_embedding = self.embedding_client.encode([query])[0].tolist()
+
+        return SearchMemoryEntry(
+            query=query,
+            query_embedding=query_embedding,
+            turn_id=request.turn_id,
+            tool_name=tool_name,
+            search_engine=request.search_engine,
+            action=block.action,
+            executed_external_api=block.action in (SearchAction.EXECUTE, SearchAction.MERGE, SearchAction.REDUCE_TOPK),
+            tool_status=tool_status,
+            raw_result=result_str,
+            returned_observation=result_str,
+            url_list=url_list,
+            raw_observation_tokens=raw_tokens,
+            returned_observation_tokens=raw_tokens,
+            latency_ms=0.0,
+        )
+
+    def _extract_urls(self, result: str) -> list[str]:
+        return re.findall(r'\]\((https?://[^\s)]+)\)', result)
+
+    _tiktoken_encoder = None
+
+    def _count_tokens(self, text: str) -> int:
+        if self._tiktoken_encoder is None:
+            import tiktoken
+            MultiTurnReactAgent._tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+        return len(self._tiktoken_encoder.encode(text))
+
+    def _merge_queries(self, queries: list[str], metrics: Optional[MetricsCollector] = None) -> str:
+        if len(queries) <= 1:
+            return queries[0] if queries else ""
+
+        rephrase_client = ModelClient('rephrase')
+        if not rephrase_client.model or not rephrase_client.api_key:
+            print(f"[MERGE] Rephrase model not available, using first query: '{queries[0]}'")
+            return queries[0]
+
+        client = rephrase_client.get_client()
+        current = queries[0]
+
+        for next_q in queries[1:]:
+            prompt_content = REPHASE_PROMPT.format(q1=current, q2=next_q)
+            messages = [{"role": "user", "content": prompt_content}]
+
+            start_time = time.time()
+            try:
+                print(f"[MERGE] Merging: '{current[:60]}' + '{next_q[:60]}'")
+                chat_response = client.chat.completions.create(
+                    model=rephrase_client.model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=40960,
+                )
+                latency_ms = (time.time() - start_time) * 1000
+                content = chat_response.choices[0].message.content
+                if content is None:
+                    content = chat_response.choices[0].message.reasoning
+                merged = content.strip()
+                print(f"[MERGE] Result: '{merged[:60]}'")
+
+                if metrics:
+                    usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
+                    metrics.record_model_call(
+                        model_group="rephrase_model",
+                        success=True,
+                        latency_ms=latency_ms,
+                        usage=usage,
+                    )
+                    metrics.record_prompt_breakdown(
+                        model_group="rephrase_model",
+                        messages=messages,
+                        usage=usage,
+                    )
+
+                current = merged
+            except Exception as e:
+                latency_ms = (time.time() - start_time) * 1000
+                print(f"[MERGE] Error: {e}, keeping current query")
+                if metrics:
+                    metrics.record_model_call(
+                        model_group="rephrase_model",
+                        success=False,
+                        latency_ms=latency_ms,
+                        usage=None,
+                    )
+
+        return current
 
 

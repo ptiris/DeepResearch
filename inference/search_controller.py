@@ -160,6 +160,7 @@ class QueryBlock:
     reason: str
     cache_entry: Optional[SearchMemoryEntry] = None
     adjusted_topk: Optional[int] = None
+    merged_query: Optional[str] = None
 
 
 @dataclass
@@ -220,6 +221,9 @@ class SearchController:
         self.w_redundancy = self.params.get("w_redundancy", 0.8)
         self.w_repeated_failure = self.params.get("w_repeated_failure", 0.6)
 
+        self.last_intra_sim: list[list[float]] = []
+        self._execution_info: dict = {}
+
    
     def pre_search(
         self,
@@ -231,6 +235,12 @@ class SearchController:
 
         embeddings = self._embed_queries(query_list)
         intra_sim = self._compute_intra_similarity(embeddings)
+        print(f"[Search Controller] Query similarity matrix for {n} queries:")
+        for i in range(n):
+            print(f"  Query[{i}]: {query_list[i][:50]}...")
+            for j in range(n):
+                print(f"    sim[{i}][{j}] = {intra_sim[i][j]:.4f}")
+        self.last_intra_sim = intra_sim
         cache_hits = [
             state.memory.find_similar(emb, top_k=3) for emb in embeddings
         ]
@@ -279,7 +289,10 @@ class SearchController:
                 adjusted_topk=decision.adjusted_topk,
             ))
             assigned.add(i)
-
+        print("[Search Controller] Final query blocks are")
+        for block in blocks :
+            print(f"Block {i} with query : {block.queries}")
+            print(f"Actions: {block.action}")
         return PreSearchDecision(
             task_id=request.task_id,
             turn_id=request.turn_id,

@@ -403,3 +403,32 @@ class MetricsCollector:
             }
         out["_total_prompt_tokens"] = int(round(total))
         return out
+
+
+class QueryProcessLogger:
+    def __init__(self, output_path: str):
+        self.output_path = output_path
+        self.records: list[dict] = []
+
+    def record_turn(
+        self,
+        task_id: str,
+        turn_id: int,
+        query_list: list[str],
+        intra_sim: list[list[float]],
+        blocks: list[dict],
+    ):
+        self.records.append({
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "query_list": query_list,
+            "intra_sim_matrix": intra_sim,
+            "blocks": blocks,
+        })
+
+    def flush(self):
+        import json
+        with open(self.output_path, "a", encoding="utf-8") as f:
+            for record in self.records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.records.clear()
