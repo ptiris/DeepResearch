@@ -190,6 +190,11 @@ class BudgetState:
         elif p < 0.7:
             return "medium"
         return "high"
+    @observation_tokens_used.setter
+    def observation_tokens_used(self, value):
+        self.observation_tokens_used = value
+    
+    
 
 
 @dataclass
@@ -823,6 +828,7 @@ class SearchController:
         """Add a search entry to memory after post_search processing.
 
         Performs deduplication/compression before adding to memory.
+        Updates budget state for successful external API calls.
 
         Parameters
         ----------
@@ -831,6 +837,8 @@ class SearchController:
         state : ControllerState
             ControllerState with memory to update.
         """
-        # TODO: Deduplicate/compress before adding
-        # TODO: Update effective_search_calls and observation_tokens_used in budget
+        if entry.executed_external_api and entry.tool_status == ToolStatus.SUCCESS_NONEMPTY:
+            state.budget_state.effective_search_calls += 1
+            state.budget_state.observation_tokens_used += entry.returned_observation_tokens
+
         state.memory.add(entry)
