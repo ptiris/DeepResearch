@@ -165,10 +165,12 @@ if __name__ == "__main__":
         print(f"[DEBUG] System prompt contains 'search': {has_search}")
         print(f"[DEBUG] System prompt contains 'aliyun_search': {has_aliyun}")
 
+        disable_search_controller = os.getenv("DISABLE_SEARCH_CONTROLLER", "false").lower() in ("true", "1", "yes")
         test_agent = MultiTurnReactAgent(
             llm_cfg=llm_cfg,
             function_list=function_list,
             system_prompt=system_prompt,
+            disable_search_controller=disable_search_controller,
         )
         test_agent.set_query_logger(dataset_dir)
 

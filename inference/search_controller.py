@@ -190,9 +190,7 @@ class BudgetState:
         elif p < 0.7:
             return "medium"
         return "high"
-    @observation_tokens_used.setter
-    def observation_tokens_used(self, value):
-        self.observation_tokens_used = value
+
     
     
 
@@ -467,10 +465,12 @@ class SearchController:
         params: dict | None = None,
         embed_fn=None,
         context_profile: ContextProfile | None = None,
+        disable_search_controller: bool = False,
     ):
-        
+
         self.params = params or {}
-        self.embed_fn = embed_fn  # Callable[[str], list[float]]
+        self.embed_fn = embed_fn
+        self.disable_search_controller = disable_search_controller or self.params.get("disable_search_controller", False)
         self.context_profile = context_profile or ContextProfile(
             policy="append_history",
             replay_factor=2.0,
@@ -523,6 +523,22 @@ class SearchController:
         PreSearchDecision
             PreSearchDecision containing query blocks with assigned actions.
         """
+        if self.disable_search_controller:
+            blocks = [
+                QueryBlock(
+                    queries=[q],
+                    original_indices=[i],
+                    action=SearchAction.EXECUTE,
+                    reason="search controller disabled, force execute",
+                )
+                for i, q in enumerate(request.query_list)
+            ]
+            return PreSearchDecision(
+                task_id=request.task_id,
+                turn_id=request.turn_id,
+                query_blocks=blocks,
+            )
+
         query_list = request.query_list
         n = len(query_list)
 
@@ -550,7 +566,9 @@ class SearchController:
 
             merge_group = [i]
             for k in range(i + 1, n):
-                if k not in assigned and intra_sim[i][k] >= self.high_sim:
+                if k not in assigned and all(
+                    intra_sim[zk][k] >= self.high_sim for zk in merge_group
+                ):
                     merge_group.append(k)
 
             if len(merge_group) > 1:

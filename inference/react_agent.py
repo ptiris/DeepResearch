@@ -68,16 +68,19 @@ class MultiTurnReactAgent(FnCallAgent):
         self,
         function_list: Optional[Union[List[Union[str, Dict, BaseTool]]]],
         llm_cfg: Optional[Dict] = None,
-        system_prompt: Optional[str] = None) -> None:
+        system_prompt: Optional[str] = None,
+        disable_search_controller: bool = False,
+    ) -> None:
         super().__init__(llm=DummyLLM(), function_list=function_list)
         self.llm_generate_cfg = llm_cfg.get("generate_cfg", {}) if llm_cfg else {}
         self.custom_system_prompt = system_prompt
         self._function_list = function_list if function_list else []
-        
+        self.disable_search_controller = disable_search_controller
+
         # Initialize SearchController
         self.embedding_client = EmbeddingClient()
         self.search_controller = SearchController(
-            params={"high_similarity": 0.90, "medium_similarity": 0.75, "default_topk": 10},
+            params={"high_similarity": 0.90, "medium_similarity": 0.75, "default_topk": 10, "disable_search_controller": self.disable_search_controller},
             embed_fn=lambda q: self.embedding_client.encode([q])[0].tolist(),
             context_profile=ContextProfile(
                 policy="append_history",
@@ -495,6 +498,14 @@ class MultiTurnReactAgent(FnCallAgent):
             query_list = [query_list]
 
         if not query_list:
+            if metrics:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    success=False,
+                    latency_ms=(time.perf_counter() - tool_start) * 1000.0,
+                    effective_calls=0,
+                    status_code=400,
+                )
             return "[SearchController] Error: empty query list"
 
         request = SearchRequest(
@@ -519,6 +530,31 @@ class MultiTurnReactAgent(FnCallAgent):
         for block, result_str, latency in zip(decision.query_blocks, block_results, block_latencies):
             entry = self._build_memory_entry(tool_name, block, result_str, request, latency)
             self.search_controller.update_memory(entry, self.controller_state)
+
+        if metrics:
+            effective_calls = sum(
+                1 for block in decision.query_blocks
+                if block.action in (SearchAction.EXECUTE, SearchAction.MERGE, SearchAction.REDUCE_TOPK)
+            )
+            reuse_count = sum(
+                len(block.queries) for block in decision.query_blocks
+                if block.action == SearchAction.REUSE_CACHE
+            )
+            merge_saved_count = sum(
+                len(block.queries) - 1 for block in decision.query_blocks
+                if block.action == SearchAction.MERGE
+            )
+            total_latency = sum(block_latencies)
+            has_error = any("Error" in result_str for result_str in block_results)
+            metrics.record_tool_call(
+                tool_name=tool_name,
+                success=not has_error,
+                latency_ms=total_latency,
+                effective_calls=effective_calls,
+                status_code=None,
+                reuse_count=reuse_count,
+                merge_saved_count=merge_saved_count,
+            )
 
         return "\n=======\n".join(block_results)
 
@@ -679,54 +715,52 @@ class MultiTurnReactAgent(FnCallAgent):
             return queries[0]
 
         client = rephrase_client.get_client()
-        current = queries[0]
 
-        for next_q in queries[1:]:
-            prompt_content = REPHASE_PROMPT.format(q1=current, q2=next_q)
-            messages = [{"role": "user", "content": prompt_content}]
+        # Format all queries into a numbered list for the multi-query prompt
+        queries_text = "\n".join(f"Query {i+1}: {q}" for i, q in enumerate(queries))
+        prompt_content = MERGE_MULTI_PROMPT.format(queries=queries_text)
+        messages = [{"role": "user", "content": prompt_content}]
 
-            start_time = time.time()
-            try:
-                print(f"[MERGE] Merging: '{current[:60]}' + '{next_q[:60]}'")
-                chat_response = client.chat.completions.create(
-                    model=rephrase_client.model,
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=40960,
+        start_time = time.time()
+        try:
+            print(f"[MERGE] Merging {len(queries)} queries at once: {[q[:40] for q in queries]}")
+            chat_response = client.chat.completions.create(
+                model=rephrase_client.model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=40960,
+            )
+            latency_ms = (time.time() - start_time) * 1000
+            content = chat_response.choices[0].message.content
+            if content is None:
+                content = chat_response.choices[0].message.reasoning
+            merged = content.strip()
+            print(f"[MERGE] Result: '{merged[:80]}'")
+
+            if metrics:
+                usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
+                metrics.record_model_call(
+                    model_group="rephrase_model",
+                    success=True,
+                    latency_ms=latency_ms,
+                    usage=usage,
                 )
-                latency_ms = (time.time() - start_time) * 1000
-                content = chat_response.choices[0].message.content
-                if content is None:
-                    content = chat_response.choices[0].message.reasoning
-                merged = content.strip()
-                print(f"[MERGE] Result: '{merged[:60]}'")
+                metrics.record_prompt_breakdown(
+                    model_group="rephrase_model",
+                    messages=messages,
+                    usage=usage,
+                )
 
-                if metrics:
-                    usage = MetricsCollector.usage_to_dict(getattr(chat_response, "usage", None))
-                    metrics.record_model_call(
-                        model_group="rephrase_model",
-                        success=True,
-                        latency_ms=latency_ms,
-                        usage=usage,
-                    )
-                    metrics.record_prompt_breakdown(
-                        model_group="rephrase_model",
-                        messages=messages,
-                        usage=usage,
-                    )
-
-                current = merged
-            except Exception as e:
-                latency_ms = (time.time() - start_time) * 1000
-                print(f"[MERGE] Error: {e}, keeping current query")
-                if metrics:
-                    metrics.record_model_call(
-                        model_group="rephrase_model",
-                        success=False,
-                        latency_ms=latency_ms,
-                        usage=None,
-                    )
-
-        return current
-
+            return merged
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            print(f"[MERGE] Error: {e}, falling back to first query")
+            if metrics:
+                metrics.record_model_call(
+                    model_group="rephrase_model",
+                    success=False,
+                    latency_ms=latency_ms,
+                    usage=None,
+                )
+            return queries[0]
 

@@ -100,6 +100,22 @@ Query 2: {q2}
 """
 
 
+MERGE_MULTI_PROMPT = """You are given a list of search queries that are semantically similar.
+
+Merge ALL of them into ONE single search query that:
+- preserves ALL important information, constraints, facts, names, dates, and locations from every query
+- keeps technical constraints such as site:, year, language, exact phrases
+- does NOT make the query more general or drop any query's unique details
+- is concise and suitable for a search engine
+
+Return ONLY the final merged query, nothing else.
+
+Queries:
+{queries}
+"""
+
+
+
 def build_system_prompt_new(available_tools):
     """Build system prompt with only the specified available tools."""
     schemas = [TOOL_SCHEMAS[t] for t in available_tools if t in TOOL_SCHEMAS]

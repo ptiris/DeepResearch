@@ -76,3 +76,47 @@ python3 inference/summarize_metrics.py --dataset_dir output/alibaba/tongyi-deepr
 
 python3 inference/summarize_metrics.py --dataset_dir output/GAIA/alibaba/tongyi-deepresearch-30b-a3b/gaia-level2-10-30b-iqs --strict
 ```
+
+# Search Controller
+
+协调搜索合并优化、缓存复用、预算管理。
+
+## 调用流程
+
+```
+LLM 生成查询 → pre_search(request, state) → PreSearchDecision
+                              ↓
+                        外部执行搜索(custom call)
+                              ↓
+                   post_search(request, result, state)
+                              ↓
+                   update_memory(entry, state)
+```
+
+## 核心输入/输出
+
+- **输入**：`SearchRequest`（含 query_list、tool_name、search_engine）
+- **输出**：`PreSearchDecision`（含 QueryBlock 列表，每块有 action）
+
+## 决策动作 (SearchAction)
+
+| 动作 | 触发条件 |
+|------|---------|
+| `EXECUTE` | 正常执行 |
+| `MERGE` | turn 内query间相似度 ≥ 0.90 |
+| `REUSE_CACHE` | turn 之间query缓存相似度 ≥ 0.90 |
+| `REDUCE_TOPK` | 高预算压力 |
+
+## 配置重点
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `high_similarity` | 0.90 | 缓存复用/查询合并阈值 |
+| `search_call_budget` | 10 | 最大搜索调用次数 |
+| `observation_token_budget` | 8000 | 最大 token 数 |
+
+**注意**：`embed_fn` 必须设置，这里是调用 embedding_client。
+
+## 注意
+
+- `post_search`  目前为 pass-through 实现，即没有激活
