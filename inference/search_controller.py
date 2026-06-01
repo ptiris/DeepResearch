@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -256,6 +258,7 @@ class SearchMemoryEntry:
     raw_observation_tokens: int = 0
     returned_observation_tokens: int = 0
     latency_ms: float = 0.0
+    selected_result_indices: list[int] = field(default_factory=list)
 
 
 class SearchMemory:
@@ -372,6 +375,12 @@ class QueryBlock:
     cache_entry: Optional[SearchMemoryEntry] = None
     adjusted_topk: Optional[int] = None
     merged_query: Optional[str] = None
+    raw_result: str = ""
+    returned_observation: str = ""
+    selected_result_indices: list[int] = field(default_factory=list)
+    raw_observation_tokens: int = 0
+    returned_observation_tokens: int = 0
+    reuse_pointer: bool = False
 
 
 @dataclass
@@ -435,6 +444,20 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class SearchController:
     """Coordinates search execution with caching, deduplication, and budget management.
     
@@ -478,14 +501,20 @@ class SearchController:
             cache_replay_policy="pointer",
         )
 
-        self.high_sim = self.params.get("high_similarity", 0.90)
-        self.medium_sim = self.params.get("medium_similarity", 0.75)
-        self.pointer_turn_dist = self.params.get("pointer_turn_distance", 3)
+        self.high_sim = self.params.get("high_similarity", _env_float("SEARCH_CONTROLLER_HIGH_SIM", 0.90))
+        self.medium_sim = self.params.get("medium_similarity", _env_float("SEARCH_CONTROLLER_MEDIUM_SIM", 0.70))
+        self.pointer_turn_dist = self.params.get("pointer_turn_distance", _env_int("SEARCH_CONTROLLER_REUSE_POINTER_WINDOW", 3))
+        self.reduce_topk = self.params.get("reduce_topk", _env_int("SEARCH_CONTROLLER_REDUCE_TOPK", 7))
 
         self.cost_per_search = self.params.get("cost_per_search", 0.01)
         self.cost_per_obs_token = self.params.get("cost_per_obs_token", 0.00001)
         self.estimated_obs_tokens = self.params.get("estimated_obs_tokens", 800)
-        self.estimated_replay_factor = self.params.get("estimated_replay_factor", 2.0)
+        self.estimated_replay_factor = self.params.get("estimated_replay_factor", _env_float("SEARCH_MMR_REPLAY_FACTOR", 3.0))
+        self.mmr_alpha = self.params.get("mmr_alpha", _env_float("SEARCH_MMR_ALPHA", 0.35))
+        self.mmr_beta = self.params.get("mmr_beta", _env_float("SEARCH_MMR_BETA", 0.45))
+        self.mmr_gamma = self.params.get("mmr_gamma", _env_float("SEARCH_MMR_GAMMA", 0.15))
+        self.mmr_threshold = self.params.get("mmr_threshold", _env_float("SEARCH_MMR_THRESHOLD", 0.05))
+        self.mmr_min_results = self.params.get("mmr_min_results", _env_int("SEARCH_MMR_MIN_RESULTS", 5))
         self.latency_cost_coeff = self.params.get("latency_cost_coeff", 0.001)
         self.estimated_latency_ms = self.params.get("estimated_latency_ms", 500.0)
         self.cost_weight = self.params.get("cost_weight", 1.0)
@@ -553,9 +582,6 @@ class SearchController:
         cache_hits = [
             state.memory.find_similar(emb, top_k=3) for emb in embeddings
         ]
-        pressure = state.budget_state.pressure
-        pressure_level = state.budget_state.pressure_level
-
         assigned: set[int] = set()
         blocks: list[QueryBlock] = []
 
@@ -586,8 +612,6 @@ class SearchController:
                 query_list=query_list,
                 intra_sim=intra_sim,
                 cache_hits=cache_hits,
-                pressure=pressure,
-                pressure_level=pressure_level,
                 budget_state=state.budget_state,
             )
 
@@ -699,8 +723,6 @@ class SearchController:
         query_list: list[str],
         intra_sim: list[list[float]],
         cache_hits: list[list[tuple[SearchMemoryEntry, float]]],
-        pressure: float,
-        pressure_level: str,
         budget_state: BudgetState,
     ) -> QueryDecision:
         """Make a decision for a single query based on cache and budget state.
@@ -734,7 +756,7 @@ class SearchController:
         if best_entry is not None and best_sim >= self.high_sim:
             turn_dist = budget_state.current_turn - best_entry.turn_id # Forget when turn_dist is sometimes too far
 
-            if best_entry.tool_status == ToolStatus.SUCCESS_NONEMPTY:
+            if best_entry.tool_status in (ToolStatus.SUCCESS_NONEMPTY, ToolStatus.CACHED):
                 return QueryDecision(
                     query=query,
                     original_index=index,
@@ -754,26 +776,25 @@ class SearchController:
                     )
                 
 
-        if pressure_level == "high" and self.context_profile.admission_policy == "budgeted":
-            for j in range(index):
-                if self.medium_sim <= intra_sim[index][j] < self.high_sim:
-                    adjusted_topk = self._reduce_topk(budget_state)
-                    return QueryDecision(
-                        query=query,
-                        original_index=index,
-                        action=SearchAction.REDUCE_TOPK,
-                        reason=f"medium intra-call similarity ({intra_sim[index][j]:.3f}) with query[{j}] under high budget pressure",
-                        adjusted_topk=adjusted_topk,
-                    )
-
-            adjusted_topk = self._reduce_topk(budget_state)
+        if best_entry is not None and self.medium_sim <= best_sim < self.high_sim:
             return QueryDecision(
                 query=query,
                 original_index=index,
                 action=SearchAction.REDUCE_TOPK,
-                reason=f"no cache hit, high budget pressure ({pressure:.2f})",
-                adjusted_topk=adjusted_topk,
+                reason=f"medium cache similarity ({best_sim:.3f}) with historical query: '{best_entry.query}'",
+                cache_entry=best_entry,
+                adjusted_topk=self._reduce_topk(budget_state),
             )
+
+        for j in range(index):
+            if self.medium_sim <= intra_sim[index][j] < self.high_sim:
+                return QueryDecision(
+                    query=query,
+                    original_index=index,
+                    action=SearchAction.REDUCE_TOPK,
+                    reason=f"medium intra-call similarity ({intra_sim[index][j]:.3f}) with query[{j}]",
+                    adjusted_topk=self._reduce_topk(budget_state),
+                )
 
         return QueryDecision(
             query=query,
@@ -802,41 +823,198 @@ class SearchController:
         int
             Reduced top-k value, minimum 5.
         """
-        base_topk = self.params.get("default_topk", 10)
-        pressure = budget_state.pressure
-        reduced = max(5, int(base_topk * (1.0 - 0.7 * pressure)))
-        return reduced
+        return max(1, int(self.reduce_topk))
 
     def post_search(
         self,
         request: SearchRequest,
         raw_result: str,
         state: ControllerState,
+        block: QueryBlock | None = None,
     ) -> str:
-        """Process raw search results and update memory.
+        """Return the observation admitted to agent context for a search block."""
+        block = block or QueryBlock(
+            queries=request.query_list,
+            original_indices=list(range(len(request.query_list))),
+            action=SearchAction.EXECUTE,
+            reason="post_search fallback block",
+        )
 
-        Parses the raw search result, extracts URLs/snippets/token counts,
-        builds a SearchMemoryEntry, and updates the controller state.
+        source_raw = raw_result or ""
+        if block.action == SearchAction.REUSE_CACHE and block.cache_entry is not None:
+            turn_dist = request.turn_id - block.cache_entry.turn_id
+            if turn_dist <= self.pointer_turn_dist:
+                pointer = (
+                    "[CACHE HIT] Current query is similar to a recent search. "
+                    f"See turn {block.cache_entry.turn_id} search result for query: "
+                    f"{block.cache_entry.query}"
+                )
+                block.raw_result = block.cache_entry.raw_result
+                block.returned_observation = pointer
+                block.selected_result_indices = []
+                block.raw_observation_tokens = self._count_tokens(block.raw_result)
+                block.returned_observation_tokens = self._count_tokens(pointer)
+                block.reuse_pointer = True
+                return pointer
+            source_raw = block.cache_entry.raw_result or block.cache_entry.returned_observation
 
-        Parameters
-        ----------
-        request : SearchRequest
-            Original SearchRequest for context.
-        raw_result : str
-            Raw result string from the search tool.
-        state : ControllerState
-            ControllerState to update with new entry and budget.
+        entries = self.parse_search_results(source_raw)
+        if not entries:
+            block.raw_result = source_raw
+            block.returned_observation = source_raw
+            block.selected_result_indices = []
+            block.raw_observation_tokens = self._count_tokens(source_raw)
+            block.returned_observation_tokens = block.raw_observation_tokens
+            return source_raw
 
-        Returns
-        -------
-        str
-            Processed observation string to return to the agent.
-        """
-        # TODO: Parse raw_result → url_list, domain_list, title_snippet_list, token counts
-        # TODO: Build SearchMemoryEntry
-        # TODO: Update budget state (effective_search_calls, observation_tokens_used)
-        # TODO: Decide observation length based on context_profile
-        return raw_result  # pass-through for now
+        candidate_entries = entries
+        if block.action == SearchAction.REDUCE_TOPK:
+            candidate_entries = entries[: max(1, block.adjusted_topk or self.reduce_topk)]
+        elif block.action == SearchAction.REUSE_CACHE:
+            candidate_entries = entries[:5]
+
+        query = block.merged_query or (block.queries[0] if block.queries else "")
+        selected = self._select_results_mmr(
+            query=query,
+            candidates=candidate_entries,
+            history_entries=state.memory.entries,
+            token_budget=max(1, state.budget_state.observation_token_budget),
+            max_results=len(candidate_entries),
+        )
+        if not selected:
+            selected = candidate_entries[: min(len(candidate_entries), self.mmr_min_results)]
+
+        returned = self._format_selected_observation(source_raw, selected)
+        block.raw_result = source_raw
+        block.returned_observation = returned
+        block.selected_result_indices = [item["index"] for item in selected]
+        block.raw_observation_tokens = self._count_tokens(source_raw)
+        block.returned_observation_tokens = self._count_tokens(returned)
+        block.reuse_pointer = False
+        return returned
+
+    def parse_search_results(self, raw_result: str) -> list[dict]:
+        """Parse formatted search tool output into indexed result dictionaries."""
+        if not raw_result or not raw_result.strip():
+            return []
+
+        pattern = re.compile(
+            r"(?:^|\n)(\d+)\.\s+\[(.*?)\]\((.*?)\)(.*?)(?=\n\d+\.\s+\[|\n=======|\Z)",
+            re.DOTALL,
+        )
+        entries = []
+        for match in pattern.finditer(raw_result):
+            body = match.group(4).strip()
+            text = f"{match.group(1)}. [{match.group(2)}]({match.group(3)})"
+            if body:
+                text = f"{text}\n{body}"
+            entries.append({
+                "index": len(entries) + 1,
+                "display_index": int(match.group(1)),
+                "title": match.group(2).strip(),
+                "url": match.group(3).strip(),
+                "body": body,
+                "text": text.strip(),
+            })
+        return entries
+
+    def _select_results_mmr(
+        self,
+        query: str,
+        candidates: list[dict],
+        history_entries: list[SearchMemoryEntry],
+        token_budget: int,
+        max_results: int,
+    ) -> list[dict]:
+        if not candidates:
+            return []
+
+        query_emb = self._embed_text(query)
+        candidate_embs = self._embed_texts([self._result_similarity_text(item) for item in candidates])
+        history_texts = self._selected_history_result_texts(history_entries)
+        history_embs = self._embed_texts(history_texts) if history_texts else []
+        token_lengths = [self._count_tokens(item["text"]) for item in candidates]
+
+        selected_positions: list[int] = []
+        remaining = set(range(len(candidates)))
+        used_tokens = 0
+        max_results = max(1, min(max_results, len(candidates)))
+
+        while remaining and len(selected_positions) < max_results:
+            best_pos = None
+            best_score = -float("inf")
+            for pos in remaining:
+                rel = _cosine_similarity(candidate_embs[pos], query_emb)
+                red_cur = 0.0
+                if selected_positions:
+                    red_cur = max(
+                        _cosine_similarity(candidate_embs[pos], candidate_embs[selected_pos])
+                        for selected_pos in selected_positions
+                    )
+                red_hist = 0.0
+                if history_embs:
+                    red_hist = max(_cosine_similarity(candidate_embs[pos], hist_emb) for hist_emb in history_embs)
+                raw_cost = token_lengths[pos] * (1.0 + self.estimated_replay_factor)
+                cost = min(1.0, raw_cost / max(float(token_budget), 1.0))
+                score = rel - self.mmr_alpha * red_cur - self.mmr_beta * red_hist - self.mmr_gamma * cost
+                if score > best_score:
+                    best_score = score
+                    best_pos = pos
+
+            if best_pos is None:
+                break
+            if best_score < self.mmr_threshold and len(selected_positions) >= min(self.mmr_min_results, len(candidates)):
+                break
+            if used_tokens + token_lengths[best_pos] > token_budget:
+                remaining.remove(best_pos)
+                continue
+
+            selected_positions.append(best_pos)
+            used_tokens += token_lengths[best_pos]
+            remaining.remove(best_pos)
+
+        return [candidates[pos] for pos in selected_positions]
+
+    def _selected_history_result_texts(self, entries: list[SearchMemoryEntry]) -> list[str]:
+        texts: list[str] = []
+        for entry in entries:
+            parsed = self.parse_search_results(entry.raw_result)
+            if not parsed:
+                continue
+            by_index = {item["index"]: item for item in parsed}
+            for result_index in entry.selected_result_indices:
+                item = by_index.get(result_index)
+                if item is not None:
+                    texts.append(self._result_similarity_text(item))
+        return texts
+
+    def _result_similarity_text(self, item: dict) -> str:
+        return "\n".join(part for part in [item.get("title", ""), item.get("url", ""), item.get("body", "")] if part)
+
+    def _embed_text(self, text: str) -> list[float]:
+        return self._embed_texts([text])[0]
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if self.embed_fn is None:
+            return [[] for _ in texts]
+        embeddings: list[list[float]] = []
+        for text in texts:
+            try:
+                embeddings.append(list(self.embed_fn(text)))
+            except Exception as exc:
+                print(f"[Search Controller] Embedding failed, using zero vector: {exc}")
+                embeddings.append([])
+        return embeddings
+
+    def _format_selected_observation(self, raw_result: str, selected: list[dict]) -> str:
+        first_line = raw_result.strip().splitlines()[0] if raw_result.strip() else "Search results"
+        body = "\n\n".join(item["text"] for item in selected)
+        return f"{first_line}\n\n## Controlled Search Results\n{body}" if body else first_line
+
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(re.findall(r"\S+", text))
 
     def update_memory(
         self,

@@ -80,7 +80,14 @@ class MultiTurnReactAgent(FnCallAgent):
         # Initialize SearchController
         self.embedding_client = EmbeddingClient()
         self.search_controller = SearchController(
-            params={"high_similarity": 0.90, "medium_similarity": 0.75, "default_topk": 10, "disable_search_controller": self.disable_search_controller},
+            params={
+                "high_similarity": float(os.getenv("SEARCH_CONTROLLER_HIGH_SIM", "0.90")),
+                "medium_similarity": float(os.getenv("SEARCH_CONTROLLER_MEDIUM_SIM", "0.70")),
+                "default_topk": 10,
+                "reduce_topk": int(os.getenv("SEARCH_CONTROLLER_REDUCE_TOPK", "7")),
+                "pointer_turn_distance": int(os.getenv("SEARCH_CONTROLLER_REUSE_POINTER_WINDOW", "3")),
+                "disable_search_controller": self.disable_search_controller,
+            },
             embed_fn=lambda q: self.embedding_client.encode([q])[0].tolist(),
             context_profile=ContextProfile(
                 policy="append_history",
@@ -522,7 +529,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
         decision = self.search_controller.pre_search(request, self.controller_state)
 
-        block_results, block_latencies = self._execute_query_blocks(tool_name, tool_args, decision, metrics, tool_start, **kwargs)
+        block_results, block_latencies = self._execute_query_blocks(tool_name, tool_args, request, decision, metrics, tool_start, **kwargs)
 
         if self.query_logger is not None:
             self._log_query_processing(request.task_id, request.turn_id, query_list, decision, block_results)
@@ -544,6 +551,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 len(block.queries) - 1 for block in decision.query_blocks
                 if block.action == SearchAction.MERGE
             )
+            reduce_topk_count = sum(
+                1 for block in decision.query_blocks
+                if block.action == SearchAction.REDUCE_TOPK
+            )
             total_latency = sum(block_latencies)
             has_error = any("Error" in result_str for result_str in block_results)
             metrics.record_tool_call(
@@ -554,6 +565,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 status_code=None,
                 reuse_count=reuse_count,
                 merge_saved_count=merge_saved_count,
+                reduce_topk_count=reduce_topk_count,
             )
 
         return "\n=======\n".join(block_results)
@@ -572,6 +584,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 "action": block.action.value,
                 "original_queries": block.queries,
                 "success": "Error" not in result_str,
+                "selected_result_indices": block.selected_result_indices,
+                "raw_observation_tokens": block.raw_observation_tokens,
+                "returned_observation_tokens": block.returned_observation_tokens,
+                "reuse_pointer": block.reuse_pointer,
             }
             if block.action == SearchAction.MERGE:
                 block_info["merged_query"] = block.merged_query
@@ -596,6 +612,7 @@ class MultiTurnReactAgent(FnCallAgent):
         self,
         tool_name: str,
         tool_args: dict,
+        request: SearchRequest,
         decision: PreSearchDecision,
         metrics: Optional[MetricsCollector],
         tool_start: float,
@@ -612,11 +629,16 @@ class MultiTurnReactAgent(FnCallAgent):
                 try:
                     raw = TOOL_MAP[tool_name].call(block_args, **kwargs)
                     if isinstance(raw, tuple) and len(raw) == 2:
-                        block_result, _ = raw
+                        raw_result, _ = raw
                     else:
-                        block_result = raw
+                        raw_result = raw
+                    block_result = self.search_controller.post_search(
+                        request, str(raw_result), self.controller_state, block
+                    )
                 except Exception as e:
                     block_result = f"Error: Search query failed: {str(e)}"
+                    block.raw_result = block_result
+                    block.returned_observation = block_result
                 block_results.append(block_result)
                 block_latencies.append((time.perf_counter() - block_start) * 1000.0)
 
@@ -628,22 +650,29 @@ class MultiTurnReactAgent(FnCallAgent):
                 try:
                     raw = TOOL_MAP[tool_name].call(block_args, **kwargs)
                     if isinstance(raw, tuple) and len(raw) == 2:
-                        block_result, _ = raw
+                        raw_result, _ = raw
                     else:
-                        block_result = raw
+                        raw_result = raw
+                    block_result = self.search_controller.post_search(
+                        request, str(raw_result), self.controller_state, block
+                    )
                 except Exception as e:
                     block_result = f"Error: Merged search query failed: {str(e)}"
+                    block.raw_result = block_result
+                    block.returned_observation = block_result
                 block_results.append(block_result)
                 block_latencies.append((time.perf_counter() - block_start) * 1000.0)
 
             elif block.action == SearchAction.REUSE_CACHE:
-                cached_obs = ""
                 if block.cache_entry:
-                    cached_obs = block.cache_entry.returned_observation
+                    block_result = self.search_controller.post_search(
+                        request, block.cache_entry.raw_result, self.controller_state, block
+                    )
                 else:
-                    cache_msg = "Error: Empty cache entry found"
-                cache_msg = f"[CACHE HIT] Reusing cached result for similar query.\n{cached_obs}" if cached_obs else "[CACHE HIT] Reusing cached result."
-                block_results.append(cache_msg)
+                    block_result = "Error: Empty cache entry found"
+                    block.raw_result = block_result
+                    block.returned_observation = block_result
+                block_results.append(block_result)
                 block_latencies.append(0.0)
 
             elif block.action == SearchAction.SKIP_DUPLICATE:
@@ -660,21 +689,24 @@ class MultiTurnReactAgent(FnCallAgent):
         request: SearchRequest,
         latency_ms: float = 0.0,
     ) -> SearchMemoryEntry:
-        url_list = self._extract_urls(result_str)
-        raw_tokens = self._count_tokens(result_str)
+        raw_result = block.raw_result or result_str
+        returned_observation = block.returned_observation or result_str
+        url_list = self._extract_urls(raw_result)
+        raw_tokens = block.raw_observation_tokens or self._count_tokens(raw_result)
+        returned_tokens = block.returned_observation_tokens or self._count_tokens(returned_observation)
 
         if block.action == SearchAction.REUSE_CACHE:
             tool_status = ToolStatus.CACHED
         elif block.action == SearchAction.SKIP_DUPLICATE:
             tool_status = ToolStatus.SKIPPED
-        elif "Error" in result_str:
+        elif "Error" in returned_observation:
             tool_status = ToolStatus.FAILED
-        elif not result_str.strip():
+        elif not returned_observation.strip():
             tool_status = ToolStatus.EMPTY
         else:
             tool_status = ToolStatus.SUCCESS_NONEMPTY
 
-        query = block.queries[0] # For block with MERGE , queries[0] stores the merged results.
+        query = block.merged_query or block.queries[0]
         query_embedding = self.embedding_client.encode([query])[0].tolist()
 
         return SearchMemoryEntry(
@@ -686,12 +718,13 @@ class MultiTurnReactAgent(FnCallAgent):
             action=block.action,
             executed_external_api=block.action in (SearchAction.EXECUTE, SearchAction.MERGE, SearchAction.REDUCE_TOPK),
             tool_status=tool_status,
-            raw_result=result_str,
-            returned_observation=result_str,
+            raw_result=raw_result,
+            returned_observation=returned_observation,
             url_list=url_list,
             raw_observation_tokens=raw_tokens,
-            returned_observation_tokens=raw_tokens,
+            returned_observation_tokens=returned_tokens,
             latency_ms=latency_ms,
+            selected_result_indices=block.selected_result_indices,
         )
 
     def _extract_urls(self, result: str) -> list[str]:

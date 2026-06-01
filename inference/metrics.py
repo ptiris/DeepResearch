@@ -133,6 +133,7 @@ class MetricsCollector:
         status_code: Optional[int] = None,
         reuse_count: int = 0,
         merge_saved_count: int = 0,
+        reduce_topk_count: int = 0,
     ) -> None:
         category = "search" if tool_name in self.SEARCH_TOOL_NAMES else "other"
         bucket = self._tool_stats.setdefault(tool_name, self._new_tool_bucket(category))
@@ -148,6 +149,7 @@ class MetricsCollector:
             bucket["status_codes"][status_code] = bucket["status_codes"].get(status_code, 0) + 1
         bucket["reuse_count"] += max(reuse_count, 0)
         bucket["merge_saved_count"] += max(merge_saved_count, 0)
+        bucket["reduce_topk_count"] += max(reduce_topk_count, 0)
 
     @staticmethod
     def infer_tool_success(result: Any) -> bool:
@@ -242,6 +244,7 @@ class MetricsCollector:
             "status_codes": {},
             "reuse_count": 0,
             "merge_saved_count": 0,
+            "reduce_topk_count": 0,
         }
 
     @staticmethod
@@ -376,6 +379,7 @@ class MetricsCollector:
 
         result["reuse_count"] = int(bucket.get("reuse_count", 0))
         result["merge_saved_count"] = int(bucket.get("merge_saved_count", 0))
+        result["reduce_topk_count"] = int(bucket.get("reduce_topk_count", 0))
 
         return result
 
@@ -401,6 +405,7 @@ class MetricsCollector:
             },
             "reuse_count": sum(v.get("reuse_count", 0) for v in finalized_buckets.values()),
             "merge_saved_count": sum(v.get("merge_saved_count", 0) for v in finalized_buckets.values()),
+            "reduce_topk_count": sum(v.get("reduce_topk_count", 0) for v in finalized_buckets.values()),
         }
 
     def _finalize_prompt_breakdown(self, bucket: Dict[str, float]) -> Dict[str, Any]:
