@@ -259,6 +259,8 @@ class SearchMemoryEntry:
     returned_observation_tokens: int = 0
     latency_ms: float = 0.0
     selected_result_indices: list[int] = field(default_factory=list)
+    selected_result_texts: list[str] = field(default_factory=list)
+    selected_result_embeddings: list[list[float]] = field(default_factory=list)
 
 
 class SearchMemory:
@@ -378,6 +380,9 @@ class QueryBlock:
     raw_result: str = ""
     returned_observation: str = ""
     selected_result_indices: list[int] = field(default_factory=list)
+    query_embedding: list[float] = field(default_factory=list)
+    selected_result_texts: list[str] = field(default_factory=list)
+    selected_result_embeddings: list[list[float]] = field(default_factory=list)
     raw_observation_tokens: int = 0
     returned_observation_tokens: int = 0
     reuse_pointer: bool = False
@@ -511,8 +516,8 @@ class SearchController:
         self.estimated_obs_tokens = self.params.get("estimated_obs_tokens", 800)
         self.estimated_replay_factor = self.params.get("estimated_replay_factor", _env_float("SEARCH_MMR_REPLAY_FACTOR", 3.0))
         self.mmr_alpha = self.params.get("mmr_alpha", _env_float("SEARCH_MMR_ALPHA", 0.35))
-        self.mmr_beta = self.params.get("mmr_beta", _env_float("SEARCH_MMR_BETA", 0.45))
-        self.mmr_gamma = self.params.get("mmr_gamma", _env_float("SEARCH_MMR_GAMMA", 0.15))
+        self.mmr_beta = self.params.get("mmr_beta", _env_float("SEARCH_MMR_BETA", 0))
+        self.mmr_gamma = self.params.get("mmr_gamma", _env_float("SEARCH_MMR_GAMMA", 0))
         self.mmr_threshold = self.params.get("mmr_threshold", _env_float("SEARCH_MMR_THRESHOLD", 0.05))
         self.mmr_min_results = self.params.get("mmr_min_results", _env_int("SEARCH_MMR_MIN_RESULTS", 5))
         self.latency_cost_coeff = self.params.get("latency_cost_coeff", 0.001)
@@ -527,6 +532,7 @@ class SearchController:
 
         self.last_intra_sim: list[list[float]] = []
         self._execution_info: dict = {}
+        self._text_embedding_cache: dict[str, list[float]] = {}
 
    
     def pre_search(
@@ -622,6 +628,7 @@ class SearchController:
                 reason=decision.reason,
                 cache_entry=decision.cache_entry,
                 adjusted_topk=decision.adjusted_topk,
+                query_embedding=embeddings[i],
             ))
             assigned.add(i)
         print("[Search Controller] Final query blocks are")
@@ -650,7 +657,7 @@ class SearchController:
         """
         if self.embed_fn is None:
             return [[] for _ in query_list]
-        return [self.embed_fn(q) for q in query_list]
+        return self._embed_texts(query_list)
 
 
     def _compute_intra_similarity(
@@ -852,6 +859,8 @@ class SearchController:
                 block.raw_result = block.cache_entry.raw_result
                 block.returned_observation = pointer
                 block.selected_result_indices = []
+                block.selected_result_texts = []
+                block.selected_result_embeddings = []
                 block.raw_observation_tokens = self._count_tokens(block.raw_result)
                 block.returned_observation_tokens = self._count_tokens(pointer)
                 block.reuse_pointer = True
@@ -863,6 +872,8 @@ class SearchController:
             block.raw_result = source_raw
             block.returned_observation = source_raw
             block.selected_result_indices = []
+            block.selected_result_texts = []
+            block.selected_result_embeddings = []
             block.raw_observation_tokens = self._count_tokens(source_raw)
             block.returned_observation_tokens = block.raw_observation_tokens
             return source_raw
@@ -874,20 +885,28 @@ class SearchController:
             candidate_entries = entries[:5]
 
         query = block.merged_query or (block.queries[0] if block.queries else "")
+        if not block.query_embedding and query:
+            block.query_embedding = self._embed_text(query)
         selected = self._select_results_mmr(
             query=query,
             candidates=candidate_entries,
             history_entries=state.memory.entries,
             token_budget=max(1, state.budget_state.observation_token_budget),
             max_results=len(candidate_entries),
+            query_emb=block.query_embedding,
         )
         if not selected:
             selected = candidate_entries[: min(len(candidate_entries), self.mmr_min_results)]
+            self._attach_result_embeddings(selected)
 
         returned = self._format_selected_observation(source_raw, selected)
         block.raw_result = source_raw
         block.returned_observation = returned
         block.selected_result_indices = [item["index"] for item in selected]
+        block.selected_result_texts = [self._result_similarity_text(item) for item in selected]
+        block.selected_result_embeddings = [
+            list(item.get("_similarity_embedding", [])) for item in selected
+        ]
         block.raw_observation_tokens = self._count_tokens(source_raw)
         block.returned_observation_tokens = self._count_tokens(returned)
         block.reuse_pointer = False
@@ -925,14 +944,16 @@ class SearchController:
         history_entries: list[SearchMemoryEntry],
         token_budget: int,
         max_results: int,
+        query_emb: list[float] | None = None,
     ) -> list[dict]:
         if not candidates:
             return []
 
-        query_emb = self._embed_text(query)
+        query_emb = query_emb if query_emb is not None else self._embed_text(query)
         candidate_embs = self._embed_texts([self._result_similarity_text(item) for item in candidates])
-        history_texts = self._selected_history_result_texts(history_entries)
-        history_embs = self._embed_texts(history_texts) if history_texts else []
+        for item, emb in zip(candidates, candidate_embs):
+            item["_similarity_embedding"] = emb
+        history_embs = self._selected_history_result_embeddings(history_entries)
         token_lengths = [self._count_tokens(item["text"]) for item in candidates]
 
         selected_positions: list[int] = []
@@ -975,18 +996,38 @@ class SearchController:
 
         return [candidates[pos] for pos in selected_positions]
 
-    def _selected_history_result_texts(self, entries: list[SearchMemoryEntry]) -> list[str]:
-        texts: list[str] = []
+    def _selected_history_result_embeddings(self, entries: list[SearchMemoryEntry]) -> list[list[float]]:
+        embeddings: list[list[float]] = []
         for entry in entries:
+            if entry.selected_result_embeddings:
+                embeddings.extend(entry.selected_result_embeddings)
+                continue
+
             parsed = self.parse_search_results(entry.raw_result)
             if not parsed:
                 continue
             by_index = {item["index"]: item for item in parsed}
+            selected_texts: list[str] = []
             for result_index in entry.selected_result_indices:
                 item = by_index.get(result_index)
                 if item is not None:
-                    texts.append(self._result_similarity_text(item))
-        return texts
+                    selected_texts.append(self._result_similarity_text(item))
+
+            entry.selected_result_texts = selected_texts
+            entry.selected_result_embeddings = self._embed_texts(selected_texts) if selected_texts else []
+            embeddings.extend(entry.selected_result_embeddings)
+        return embeddings
+
+    def _attach_result_embeddings(self, items: list[dict]) -> None:
+        missing = [
+            item for item in items
+            if "_similarity_embedding" not in item
+        ]
+        if not missing:
+            return
+        embeddings = self._embed_texts([self._result_similarity_text(item) for item in missing])
+        for item, emb in zip(missing, embeddings):
+            item["_similarity_embedding"] = emb
 
     def _result_similarity_text(self, item: dict) -> str:
         return "\n".join(part for part in [item.get("title", ""), item.get("url", ""), item.get("body", "")] if part)
@@ -999,8 +1040,13 @@ class SearchController:
             return [[] for _ in texts]
         embeddings: list[list[float]] = []
         for text in texts:
+            if text in self._text_embedding_cache:
+                embeddings.append(list(self._text_embedding_cache[text]))
+                continue
             try:
-                embeddings.append(list(self.embed_fn(text)))
+                emb = list(self.embed_fn(text))
+                self._text_embedding_cache[text] = emb
+                embeddings.append(list(emb))
             except Exception as exc:
                 print(f"[Search Controller] Embedding failed, using zero vector: {exc}")
                 embeddings.append([])
