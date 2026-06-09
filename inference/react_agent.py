@@ -707,7 +707,9 @@ class MultiTurnReactAgent(FnCallAgent):
             tool_status = ToolStatus.SUCCESS_NONEMPTY
 
         query = block.merged_query or block.queries[0]
-        query_embedding = self.embedding_client.encode([query])[0].tolist()
+        query_embedding = block.query_embedding
+        if not query_embedding:
+            query_embedding = self.search_controller._embed_text(query)
 
         return SearchMemoryEntry(
             query=query,
@@ -725,6 +727,8 @@ class MultiTurnReactAgent(FnCallAgent):
             returned_observation_tokens=returned_tokens,
             latency_ms=latency_ms,
             selected_result_indices=block.selected_result_indices,
+            selected_result_texts=block.selected_result_texts,
+            selected_result_embeddings=block.selected_result_embeddings,
         )
 
     def _extract_urls(self, result: str) -> list[str]:
@@ -796,4 +800,3 @@ class MultiTurnReactAgent(FnCallAgent):
                     usage=None,
                 )
             return queries[0]
-

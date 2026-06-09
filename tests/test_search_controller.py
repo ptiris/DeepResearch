@@ -48,6 +48,15 @@ class FakeEmbedder:
         return unit(0.5, 0.866)
 
 
+class CountingEmbedder(FakeEmbedder):
+    def __init__(self):
+        self.calls = {}
+
+    def __call__(self, text):
+        self.calls[text] = self.calls.get(text, 0) + 1
+        return super().__call__(text)
+
+
 def controller(**params):
     defaults = {
         "high_similarity": 0.90,
@@ -93,6 +102,8 @@ ALIYUN_RAW = """An Aliyun IQS search for 'query' found 2 results:\n\n## Web Resu
 
 SCHOLAR_RAW = """A Google scholar for 'query' found 2 results:\n\n## Scholar Results\n1. [Paper One](pdfUrl: https://paper.example/1.pdf)\npublicationInfo: Journal\nDate published: 2021\ncitedBy: 5\nAbstract one\n\n2. [Paper Two](no available link)\npublicationInfo: Conf\nDate published: 2022\nAbstract two"""
 
+HISTORY_RAW = """A Google search for 'history' found 1 result:\n\n## Web Results\n1. [History Only](https://history.example)\nHistorical snippet"""
+
 
 class SearchControllerTests(unittest.TestCase):
     def test_parse_search_result_formats(self):
@@ -118,6 +129,22 @@ class SearchControllerTests(unittest.TestCase):
 
         decision = ctrl.pre_search(request(["fresh beta"]), ControllerState(memory=SearchMemory(), budget_state=BudgetState()))
         self.assertEqual(decision.query_blocks[0].action, SearchAction.EXECUTE)
+        self.assertEqual(decision.query_blocks[0].query_embedding, [0.0, 1.0])
+
+    def test_pre_search_embeds_duplicate_query_once(self):
+        embedder = CountingEmbedder()
+        ctrl = SearchController(
+            params={
+                "high_similarity": 0.90,
+                "medium_similarity": 0.70,
+                "reduce_topk": 7,
+                "mmr_min_results": 5,
+            },
+            embed_fn=embedder,
+        )
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(current_turn=10))
+        ctrl.pre_search(request(["alpha exact", "alpha exact"]), state)
+        self.assertEqual(embedder.calls["alpha exact"], 1)
 
     def test_intra_call_medium_similarity_triggers_reduce_topk(self):
         ctrl = controller()
@@ -132,6 +159,33 @@ class SearchControllerTests(unittest.TestCase):
         entries = ctrl.parse_search_results(SERPER_RAW)
         selected = ctrl._select_results_mmr("query", entries[:3], state.memory.entries, 1000, 1)
         self.assertEqual(selected[0]["index"], 3)
+
+    def test_history_result_embeddings_are_saved_on_entry(self):
+        embedder = CountingEmbedder()
+        ctrl = SearchController(
+            params={
+                "high_similarity": 0.90,
+                "medium_similarity": 0.70,
+                "reduce_topk": 7,
+                "mmr_min_results": 1,
+                "mmr_threshold": -1.0,
+            },
+            embed_fn=embedder,
+        )
+        history = memory_entry(raw_result=HISTORY_RAW)
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
+        state.memory.add(history)
+
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
+        ctrl.post_search(request(["query"]), SERPER_RAW, state, block)
+        history_text = "History Only\nhttps://history.example\nHistorical snippet"
+        self.assertEqual(embedder.calls[history_text], 1)
+        self.assertEqual(len(history.selected_result_embeddings), 1)
+
+        ctrl._text_embedding_cache.clear()
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
+        ctrl.post_search(request(["query"]), SERPER_RAW, state, block)
+        self.assertEqual(embedder.calls[history_text], 1)
 
     def test_mmr_forces_minimum_five_below_threshold(self):
         raw = "A Google search for 'query' found 6 results:\n\n## Web Results\n" + "\n\n".join(
