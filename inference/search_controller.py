@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import datetime
+import json
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -506,6 +509,8 @@ class SearchController:
             cache_replay_policy="pointer",
         )
 
+        self.mode = self.params.get("mode", os.getenv("SEARCH_CONTROLLER_MODE", "default"))
+
         self.high_sim = self.params.get("high_similarity", _env_float("SEARCH_CONTROLLER_HIGH_SIM", 0.90))
         self.medium_sim = self.params.get("medium_similarity", _env_float("SEARCH_CONTROLLER_MEDIUM_SIM", 0.70))
         self.pointer_turn_dist = self.params.get("pointer_turn_distance", _env_int("SEARCH_CONTROLLER_REUSE_POINTER_WINDOW", 3))
@@ -529,6 +534,9 @@ class SearchController:
         self.w_no_cache = self.params.get("w_no_cache", 0.5)
         self.w_redundancy = self.params.get("w_redundancy", 0.8)
         self.w_repeated_failure = self.params.get("w_repeated_failure", 0.6)
+
+        self._mmr_log_path: str | None = None
+        self._mmr_log_lock = threading.Lock()
 
         self.last_intra_sim: list[list[float]] = []
         self._execution_info: dict = {}
@@ -565,6 +573,24 @@ class SearchController:
                     original_indices=[i],
                     action=SearchAction.EXECUTE,
                     reason="search controller disabled, force execute",
+                )
+                for i, q in enumerate(request.query_list)
+            ]
+            return PreSearchDecision(
+                task_id=request.task_id,
+                turn_id=request.turn_id,
+                query_blocks=blocks,
+            )
+
+        if self.mode == "reduce_topk":
+            print(f"[Search Controller] reduce_topk mode: forcing all {len(request.query_list)} queries to REDUCE_TOPK with topk={self.reduce_topk}")
+            blocks = [
+                QueryBlock(
+                    queries=[q],
+                    original_indices=[i],
+                    action=SearchAction.REDUCE_TOPK,
+                    reason=f"reduce_topk mode: force topk={self.reduce_topk}",
+                    adjusted_topk=self.reduce_topk,
                 )
                 for i, q in enumerate(request.query_list)
             ]
@@ -961,9 +987,29 @@ class SearchController:
         used_tokens = 0
         max_results = max(1, min(max_results, len(candidates)))
 
+        # --- MMR statistics header ---
+        print(f"\n{'='*80}")
+        print(f"[MMR] Query: {query[:100]}{'...' if len(query) > 100 else ''}")
+        print(f"[MMR] Candidates: {len(candidates)} | History ents: {len(history_embs)} | Max slots: {max_results}")
+        print(f"[MMR] Params: alpha={self.mmr_alpha} beta={self.mmr_beta} gamma={self.mmr_gamma} "
+              f"threshold={self.mmr_threshold} min_results={self.mmr_min_results} budget={token_budget}")
+        print(f"[MMR] Tokens per candidate: {token_lengths}")
+
+        n_skipped_budget = 0
+        n_stopped_threshold = 0
+        round_num = 0
+        mmr_rounds: list[dict] = []
+
         while remaining and len(selected_positions) < max_results:
+            round_num += 1
             best_pos = None
             best_score = -float("inf")
+            best_rel = 0.0
+            best_red_cur = 0.0
+            best_red_hist = 0.0
+            best_cost = 0.0
+            round_candidates: list[dict] = []
+
             for pos in remaining:
                 rel = _cosine_similarity(candidate_embs[pos], query_emb)
                 red_cur = 0.0
@@ -978,21 +1024,115 @@ class SearchController:
                 raw_cost = token_lengths[pos] * (1.0 + self.estimated_replay_factor)
                 cost = min(1.0, raw_cost / max(float(token_budget), 1.0))
                 score = rel - self.mmr_alpha * red_cur - self.mmr_beta * red_hist - self.mmr_gamma * cost
+
+                title = candidates[pos].get("title", "")[:80]
+                round_candidates.append({
+                    "idx": pos, "score": round(score, 6), "rel": round(rel, 6),
+                    "red_cur": round(red_cur, 6), "red_hist": round(red_hist, 6),
+                    "cost": round(cost, 6), "tokens": token_lengths[pos], "title": title,
+                })
+
                 if score > best_score:
                     best_score = score
                     best_pos = pos
+                    best_rel = rel
+                    best_red_cur = red_cur
+                    best_red_hist = red_hist
+                    best_cost = cost
 
             if best_pos is None:
                 break
+
+            # Log all candidate scores for this round (sorted by score descending)
+            round_candidates.sort(key=lambda x: x["score"], reverse=True)
+            print(f"\n[MMR] --- Round {round_num} ---")
+            for rc in round_candidates:
+                marker = " >> SELECTED <<" if rc["idx"] == best_pos else ""
+                print(f"[MMR]   #{rc['idx']:2d} score={rc['score']:+.4f} rel={rc['rel']:.4f} "
+                      f"red_cur={rc['red_cur']:.4f} red_hist={rc['red_hist']:.4f} "
+                      f"cost={rc['cost']:.4f} | {rc['title']}{marker}")
+
+            mmr_rounds.append({
+                "round": round_num,
+                "selected_idx": best_pos,
+                "best_score": round(best_score, 6),
+                "best_rel": round(best_rel, 6),
+                "best_red_cur": round(best_red_cur, 6),
+                "best_red_hist": round(best_red_hist, 6),
+                "best_cost": round(best_cost, 6),
+                "candidates": round_candidates,
+            })
+
             if best_score < self.mmr_threshold and len(selected_positions) >= min(self.mmr_min_results, len(candidates)):
+                print(f"[MMR] STOP: best_score={best_score:.4f} < threshold={self.mmr_threshold} "
+                      f"(selected={len(selected_positions)} >= min_results={self.mmr_min_results})")
+                n_stopped_threshold += 1
                 break
+
             if used_tokens + token_lengths[best_pos] > token_budget:
+                n_skipped_budget += 1
+                print(f"[MMR] SKIP #{best_pos}: tokens {used_tokens + token_lengths[best_pos]} > budget {token_budget}")
                 remaining.remove(best_pos)
                 continue
 
             selected_positions.append(best_pos)
             used_tokens += token_lengths[best_pos]
             remaining.remove(best_pos)
+
+        # --- MMR statistics summary ---
+        selected_rel_range: tuple[float, float] = (0.0, 0.0)
+        selected_rel_avg = 0.0
+        if selected_positions:
+            selected_scores = []
+            for pos in selected_positions:
+                rel = _cosine_similarity(candidate_embs[pos], query_emb)
+                selected_scores.append(rel)
+            selected_rel_range = (round(min(selected_scores), 6), round(max(selected_scores), 6))
+            selected_rel_avg = round(sum(selected_scores) / len(selected_scores), 6)
+
+        print(f"\n[MMR] ===== Summary =====")
+        print(f"[MMR] Selected: {len(selected_positions)}/{len(candidates)} candidates "
+              f"in {round_num} rounds | Tokens used: {used_tokens}/{token_budget}")
+        print(f"[MMR] Skipped (budget): {n_skipped_budget} | Stopped (threshold): {n_stopped_threshold} "
+              f"| Remaining: {len(remaining)}")
+        if selected_positions:
+            print(f"[MMR] Selected relevance range: [{selected_rel_range[0]:.4f}, {selected_rel_range[1]:.4f}] "
+                  f"avg={selected_rel_avg:.4f}")
+        print(f"{'='*80}\n")
+
+        # --- Write structured MMR stats to file ---
+        if self._mmr_log_path:
+            mmr_record = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "query": query,
+                "num_candidates": len(candidates),
+                "num_history_embeddings": len(history_embs),
+                "max_slots": max_results,
+                "params": {
+                    "alpha": self.mmr_alpha,
+                    "beta": self.mmr_beta,
+                    "gamma": self.mmr_gamma,
+                    "threshold": self.mmr_threshold,
+                    "min_results": self.mmr_min_results,
+                    "token_budget": token_budget,
+                },
+                "token_lengths": token_lengths,
+                "rounds": mmr_rounds,
+                "summary": {
+                    "selected_count": len(selected_positions),
+                    "total_candidates": len(candidates),
+                    "skipped_budget": n_skipped_budget,
+                    "stopped_threshold": n_stopped_threshold,
+                    "remaining": len(remaining),
+                    "total_rounds": round_num,
+                    "tokens_used": used_tokens,
+                    "selected_relevance_range": selected_rel_range,
+                    "selected_relevance_avg": selected_rel_avg,
+                },
+            }
+            with self._mmr_log_lock:
+                with open(self._mmr_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(mmr_record, ensure_ascii=False) + "\n")
 
         return [candidates[pos] for pos in selected_positions]
 
@@ -1061,6 +1201,9 @@ class SearchController:
         if not text:
             return 0
         return len(re.findall(r"\S+", text))
+
+    def set_mmr_log_path(self, path: str) -> None:
+        self._mmr_log_path = path
 
     def update_memory(
         self,

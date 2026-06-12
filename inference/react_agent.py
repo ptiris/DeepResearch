@@ -79,14 +79,18 @@ class MultiTurnReactAgent(FnCallAgent):
 
         # Initialize SearchController
         self.embedding_client = EmbeddingClient()
+        search_controller_mode = os.getenv('SEARCH_CONTROLLER_MODE', 'default')
+        reduce_topk_value = int(os.getenv('SEARCH_CONTROLLER_REDUCE_TOPK', '7'))
+        print(f"[DEBUG] SearchController mode: {search_controller_mode}, reduce_topk: {reduce_topk_value}")
         self.search_controller = SearchController(
             params={
-                "high_similarity": float(os.getenv("SEARCH_CONTROLLER_HIGH_SIM", "0.90")),
+"high_similarity": float(os.getenv("SEARCH_CONTROLLER_HIGH_SIM", "0.90")),
                 "medium_similarity": float(os.getenv("SEARCH_CONTROLLER_MEDIUM_SIM", "0.70")),
                 "default_topk": 10,
                 "reduce_topk": int(os.getenv("SEARCH_CONTROLLER_REDUCE_TOPK", "7")),
                 "pointer_turn_distance": int(os.getenv("SEARCH_CONTROLLER_REUSE_POINTER_WINDOW", "3")),
                 "disable_search_controller": self.disable_search_controller,
+                "mode": search_controller_mode,
             },
             embed_fn=lambda q: self.embedding_client.encode([q])[0].tolist(),
             context_profile=ContextProfile(
@@ -100,7 +104,7 @@ class MultiTurnReactAgent(FnCallAgent):
             memory=SearchMemory(),
             budget_state=BudgetState(
                 search_call_budget=10,
-                observation_token_budget=8000,
+                observation_token_budget=int(os.getenv("OBS_TOKEN_BUDGET", "8000")),
                 max_turns=MAX_LLM_CALL_PER_RUN,
             ),
         )
@@ -110,6 +114,8 @@ class MultiTurnReactAgent(FnCallAgent):
     def set_query_logger(self, output_dir: str):
         log_path = os.path.join(output_dir, "query_process_log.jsonl")
         self.query_logger = QueryProcessLogger(log_path)
+        mmr_log_path = os.path.join(output_dir, "mmr_stats.jsonl")
+        self.search_controller.set_mmr_log_path(mmr_log_path)
 
     def call_server(self, msgs, max_tries=10, metrics: Optional[MetricsCollector] = None):
         model_client = ModelClient('research')
@@ -639,6 +645,8 @@ class MultiTurnReactAgent(FnCallAgent):
                     block_result = f"Error: Search query failed: {str(e)}"
                     block.raw_result = block_result
                     block.returned_observation = block_result
+                if block.action == SearchAction.REDUCE_TOPK and block.adjusted_topk is not None:
+                    block_result = self._truncate_search_results(block_result, block.adjusted_topk)
                 block_results.append(block_result)
                 block_latencies.append((time.perf_counter() - block_start) * 1000.0)
 
@@ -733,6 +741,27 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _extract_urls(self, result: str) -> list[str]:
         return re.findall(r'\]\((https?://[^\s)]+)\)', result)
+
+    def _truncate_search_results(self, result_str: str, topk: int) -> str:
+        if topk <= 0:
+            return result_str
+        segments = result_str.split('\n=======\n')
+        truncated_segments = []
+        for segment in segments:
+            header_match = re.search(r'(## (?:Web|Scholar) Results\n)', segment)
+            if not header_match:
+                truncated_segments.append(segment)
+                continue
+            header = segment[:header_match.end()]
+            body = segment[header_match.end():]
+            entries = re.split(r'\n\n(?=\d+\.\s+\[)', body)
+            if len(entries) <= topk:
+                truncated_segments.append(segment)
+                continue
+            kept = entries[:topk]
+            header = re.sub(r'found \d+ results', f'found {topk} results (truncated from {len(entries)})', header)
+            truncated_segments.append(header + '\n\n'.join(kept))
+        return '\n=======\n'.join(truncated_segments)
 
     _tiktoken_encoder = None
 
