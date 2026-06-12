@@ -1,122 +1,258 @@
-# Exp Settings 
+# Tongyi DeepResearch 实验说明
 
-相较于原版，在 `.env` 文件中重要的参数：
+本文档记录当前仓库相较于原版新增或改动的启动方式、环境变量和实验参数。当前推理链路通过 `ModelClient` 调用外部 OpenAI-compatible API，不再在本地启动 vLLM 服务。
 
-## 模型调用/工具相关
-- OPENROUTER_MODEL 设置在 OpenRouter上调用的主要模型
-- DASHSCOPE_MODEL 作 Deepseek 对比实验的时候添加的Dashscope的模型参数
-- PROVIDER `openrouter` 或者`dashscope` 主要区别API调用商，因为 Openrouter 上面也有ds，但是框架大修之后可能设置为dashscope会有问题
-- REPHASE_MODEL 用于合并query的名称，需要填和 openrouer 上面的官方名称
+## 快速启动
 
-- SANDBOX_FUSION_ENDPOINT 在使用 python interpreter 之前需要把 sandbox fusion 打开，默认是运行的，可以通过 `tmux a -t sandbox` 检查运行状态。可以通过下面的方法启动：
+1. 创建环境并安装依赖：
 
-```zsh
+```bash
+conda create -n react_infer_env python=3.10.0
+conda activate react_infer_env
+pip install -r requirements.txt
+```
+
+2. 准备 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+然后在 `.env` 中填入模型、数据、工具 API key 和输出路径。
+
+3. 如启用 `PythonInterpreter`，先启动 SandboxFusion：
+
+```bash
 docker run -it -p 8080:8080 vemlp-cn-beijing.cr.volces.com/preset-images/code-sandbox:server-20250609
 ```
-- AVAILABLE_TOOLS 设置模型能够看见的工具，例如：
 
+如果已有 tmux session，可以用下面的方式检查：
+
+```bash
+tmux a -t sandbox
 ```
-# Use aliyun search
-AVAILABLE_TOOLS=aliyun_search,visit,PythonInterpreter
 
-# Use google search and scholar
-AVAILABLE_TOOLS=aliyun_search,visit,PythonInterpreter,search,scholar
+4. 运行推理：
+
+```bash
+bash inference/run_react_infer.sh
 ```
-由于这里的 Tongyi模型被微调过，它不能够区分： `search` 和 `aliyun_search` （它在搜索的时候总是调用 search），所以手动做了 remapping ， 如果存在 aliyun_search 则模型调用任何的search实际上对应aliyun_search。
-所以目前的代码逻辑不能够处理：同时使用谷歌search和aliyun search让模型自己选择。
 
-在搜索的时候默认调用的是 Serper API 这个没有改变仓库原来的逻辑
+`run_react_infer.sh` 会自动读取项目根目录下的 `.env`，检查 `OPENROUTER_API_KEY` 是否配置，然后进入 `inference/` 目录执行 `run_multi_react.py`。脚本不会启动 vLLM 或本地模型服务。
+
+## 启动脚本参数
+
+`inference/run_react_infer.sh` 会把 `.env` 中的变量转换为 `run_multi_react.py` 参数：
+
+| `.env` 变量 | 传入参数 | 说明 |
+| --- | --- | --- |
+| `DATASET` | `--dataset` | 实验/数据集名称，也会作为输出目录名的一部分 |
+| `DATA_FILE` | `--data_file` | 输入 JSON/JSONL 文件路径 |
+| `OUTPUT_PATH` | `--output` | 输出根目录 |
+| `MAX_WORKERS` | `--max_workers` | 并发 worker 数 |
+| `TEMPERATURE` | `--temperature` | 主模型采样温度 |
+| `PRESENCE_PENALTY` | `--presence_penalty` | 主模型 presence penalty |
+| `ROLLOUT_COUNT` | `--roll_out_count` | 每道题独立 rollout 次数 |
+| `WORLD_SIZE` | `--total_splits` | 分布式切分总份数，默认 1 |
+| `RANK` | `--worker_split` | 当前 worker 的 0-based rank，脚本会转成 1-based split |
+
+也可以直接运行 Python 脚本：
+
+```bash
+python -u inference/run_multi_react.py \
+  --dataset bc-zn10 \
+  --data_file /home/liuqian/DR/Tongyi/data/bc-zn10.jsonl \
+  --output /home/liuqian/DR/Tongyi/output \
+  --max_workers 30 \
+  --temperature 0.85 \
+  --presence_penalty 1.1 \
+  --roll_out_count 3
+```
+
+## 模型与 Provider 配置
+
+当前统一通过 `inference/model_client.py` 的 `ModelClient` 按阶段路由模型调用。支持的 provider：
+
+| Provider | API key | Base URL 变量 | 默认 Base URL |
+| --- | --- | --- | --- |
+| `openrouter` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `dashscope` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `openai` | `OPENAI_API_KEY` | `OPENAI_API_BASE` | `https://api.openai.com/v1` |
+
+全局默认 provider：
+
+```bash
+PROVIDER=openrouter
+```
+
+不同阶段可以单独覆盖 provider 和模型：
+
+| 阶段 | Provider 变量 | Model 变量 | 用途 |
+| --- | --- | --- | --- |
+| research | `RESEARCH_PROVIDER` | `RESEARCH_MODEL` | ReAct 主推理模型 |
+| rephrase | `REPHASE_PROVIDER` | `REPHASE_MODEL` | 查询合并/改写 |
+| summary | `SUMMARY_PROVIDER` | `SUMMARY_MODEL` | 页面摘要阶段 |
+| embedding | `EMBEDDING_PROVIDER` | 固定 `text-embedding-v4` | 相似度、去重和 Search Controller |
+
+示例：
+
+```bash
+PROVIDER=openrouter
+RESEARCH_MODEL=alibaba/tongyi-deepresearch-30b-a3b
+
+REPHASE_PROVIDER=dashscope
+REPHASE_MODEL=qwen-plus
+
+SUMMARY_PROVIDER=openai
+SUMMARY_MODEL=gpt-4o-mini
+
+EMBEDDING_PROVIDER=dashscope
+```
+
+注意：当前 `run_react_infer.sh` 会强制检查 `OPENROUTER_API_KEY`，即使主模型 provider 改成了 `dashscope` 或 `openai`，也需要在 `.env` 中给出该变量，或自行调整脚本检查逻辑。
+
+## 工具配置
+
+模型可见工具由 `AVAILABLE_TOOLS` 控制，逗号分隔：
+
+```bash
+AVAILABLE_TOOLS=aliyun_search,visit,google_scholar,PythonInterpreter
+```
+
+可选工具：
+
+| 工具 | 说明 | 依赖变量 |
+| --- | --- | --- |
+| `search` | Serper 搜索 | `SERPER_KEY_ID` |
+| `aliyun_search` | 阿里云 IQS 搜索 | `ALIYUN_IQS_API_KEY` |
+| `visit` | 网页读取/摘要 | `JINA_API_KEYS`, `API_KEY`, `API_BASE`, `SUMMARY_MODEL_NAME` |
+| `google_scholar` | Google Scholar | `SERPER_KEY_ID` |
+| `PythonInterpreter` | 代码执行 | `SANDBOX_FUSION_ENDPOINT` |
+
+关于搜索工具的特殊逻辑：
+
+- 如果启用了 `aliyun_search`，模型调用 `search` 时会被 remap 到 `aliyun_search`。
+- 当前逻辑不适合同时让模型在 Serper `search` 和阿里云 `aliyun_search` 之间自主选择。
+- 如果只想使用 Serper，配置为：
+
+```bash
+AVAILABLE_TOOLS=search,visit,google_scholar,PythonInterpreter
+```
+
+如果要处理上传文件，在问题前写入文件名，并把文件放到 `eval_data/file_corpus/`：
+
+```jsonl
+{"question": "(Uploaded 1 file: ['report.pdf'])\n\nWhat are the findings?", "answer": "..."}
+```
+
+## Search Controller 新增参数
+
+Search Controller 负责搜索查询合并、缓存复用、预算控制和动态观察结果选择。可通过 `.env` 调整：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DISABLE_SEARCH_CONTROLLER` | `false` | 设为 `true` 后绕过 Controller，所有 query 直接执行 |
+| `SEARCH_CONTROLLER_MODE` | `default` | `default` 正常策略；`reduce_topk` 强制降 topk。禁用请使用 `DISABLE_SEARCH_CONTROLLER=true` |
+| `SEARCH_CONTROLLER_HIGH_SIM` | `0.90` | 高相似阈值，用于缓存复用/合并 |
+| `SEARCH_CONTROLLER_MEDIUM_SIM` | `0.70` | 中等相似阈值，用于降低观察结果 |
+| `SEARCH_CONTROLLER_REDUCE_TOPK` | `7` | reduce_topk 模式保留结果数 |
+| `SEARCH_CONTROLLER_REUSE_POINTER_WINDOW` | `3` | 缓存复用向前查找的 turn 窗口 |
+| `SEARCH_DYNAMIC_K_OBS` | `true` | 是否启用动态 K_obs |
+| `SEARCH_MMR_ALPHA` | `0.50` | MMR 相关性权重 |
+| `SEARCH_MMR_BETA` | `0.50` | MMR 记忆/冗余惩罚权重 |
+| `SEARCH_MMR_THRESHOLD` | `0.00` | MMR 选择阈值 |
+| `SEARCH_MMR_MIN_RESULTS` | `5` | MMR 至少保留结果数 |
+
+Controller 的主要动作：
+
+| 动作 | 含义 |
+| --- | --- |
+| `EXECUTE` | 正常执行搜索 |
+| `MERGE` | turn 内多个相似 query 合并 |
+| `REUSE_CACHE` | 复用历史相似 query 的结果 |
+| `REDUCE_TOPK` | 降低返回结果数 |
+| `SKIP_DUPLICATE` | 跳过重复 query |
+| `REWRITE_REQUEST` | 请求改写 query |
+
+推理过程中会在输出目录写入：
+
+- `query_process_log.jsonl`：搜索 query、动作和结果记录
+- `mmr_stats.jsonl`：MMR 与动态 K_obs 相关统计
+
+## Query Redundancy 参数
+
+查询冗余削减可独立配置：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `REDUNDANCY_ENABLED` | `False` | 是否启用 query 冗余检测 |
+| `REDUNDANCY_STRATEGY` | `rephase` | `rephase` 改写；`skip` 跳过；`cache` 使用缓存 |
+| `REDUNDANCY_SCOPE` | `single_turn` | `single_turn` 仅当前工具调用；`global` 整个解题过程 |
+| `REDUNDANCY_SIMILARITY_THRESHOLD` | `0.8` | 判定冗余的相似度阈值 |
+| `REDUNDANCY_MAX_RETRIES` | `2` | rephase 最大重试次数 |
+
+## 数据与输出
+
+输入推荐使用 JSONL，每行包含 `question` 和 `answer`：
+
+```jsonl
+{"question": "What is X?", "answer": "Reference answer for evaluation"}
+```
+
+也支持 JSON 数组格式。
+
+输出目录结构：
+
+```text
+${OUTPUT_PATH}/${RESEARCH_MODEL}/${DATASET}/
+```
 
 
-## 实验数据/参数/保存相关
 
-- DATASET 对应实际上保存的数据的最终位置
-- DATA_FILE=/home/liuqian/DR/Tongyi/data/bc-zn50.jsonl 对应输入的 jsonl 文件的名字
-- OUTPUT_PATH=/home/liuqian/DR/Tongyi/output 输出的目标位置
 
-最后 iter1.jsonl 会保存在： {$OUTPUT_PATH} / ${$MODEL_PRODUCER} / {$MODEL_NAME} / {$DATASET} 下面
+其中 `RANK` 是 0-based，脚本会传给 `run_multi_react.py` 的 `--worker_split $(RANK + 1)`。
 
-这里是会读取  {$OUTPUT_PATH} / ${$MODEL_PRODUCER} / {$MODEL_NAME} / {$DATASET} 下面已有的结果，最终会实际上跑的是 **input data file 中有的问题，但目前目标文件中没有记录完成的问题**，对于已经在目标文件中的问题不会跑（可以断点续跑）
+## 常用实验流程
 
-## 使用样例
+例如跑一个新的数据集/参数设置：
 
-例如跑一个新的数据集/参数设置的实验
-
-1. 首先修改 DATASET 为实验的名称，例如 bc-zn10-single-turn-redundant-rephase-0.8-50
-2. 修改参数 、 输入的数据路径
-3. **确认python interpreter**是正常运行的
-4. 需要在终端启用梯子
-5. 运行实验
+1. 修改 `.env` 中的 `DATASET`，例如 `bc-zn10-single-turn-redundant-rephase-0.8-50`。
+2. 设置 `DATA_FILE`、`OUTPUT_PATH`、`RESEARCH_MODEL`、`AVAILABLE_TOOLS` 和 Search Controller 参数。
+3. 确认 `PythonInterpreter` 需要的 sandbox 正常运行。
+4. 如搜索/访问服务需要代理，在终端中设置好代理环境变量。
+5. 启动推理：
 
 ```bash
 tmux a -t tongyi
-source /mnt/data_4/envs/.venv/bin/activate 
-inference/run_react_infer.sh   
+source /mnt/data_4/envs/.venv/bin/activate
+bash inference/run_react_infer.sh
 ```
 
-6. 统计最终的正确率、数据
+## 评测与统计
+
+BrowseComp / GAIA 等 benchmark 可用：
 
 ```bash
-
-# Evaluation
 python3 evaluation/evaluate_deepsearch_official.py \
---input_folder output/alibaba/tongyi-deepresearch-30b-a3b/bc-zn10-single-turn-redundant-rephase-0.8-50 \
---judge_model dashscope/qwen3.5-plus \
---judge_prompt browsecomp \
---num_rounds 1
-
-python3 evaluation/evaluate_deepsearch_official.py \
---input_folder /home/liuqian/DR/Tongyi/output/GAIA/alibaba/tongyi-deepresearch-30b-a3b/gaia-level2-10-30b-iqs \
---judge_model dashscope/qwen3.5-plus \
---judge_prompt gaia \
---num_rounds 1
-
-# Summerize
-python3 inference/summarize_metrics.py --dataset_dir output/alibaba/tongyi-deepresearch-30b-a3b/bc-zn10-single-turn-redundant-rephase-0.8 --strict
-
-python3 inference/summarize_metrics.py --dataset_dir output/GAIA/alibaba/tongyi-deepresearch-30b-a3b/gaia-level2-10-30b-iqs --strict
+  --input_folder output/alibaba/tongyi-deepresearch-30b-a3b/bc-zn10 \
+  --judge_model dashscope/qwen3.5-plus \
+  --judge_prompt browsecomp \
+  --num_rounds 1
 ```
 
-# Search Controller
 
-协调搜索合并优化、缓存复用、预算管理。
+汇总推理指标：
 
-## 调用流程
-
-```
-LLM 生成查询 → pre_search(request, state) → PreSearchDecision
-                              ↓
-                        外部执行搜索(custom call)
-                              ↓
-                   post_search(request, result, state)
-                              ↓
-                   update_memory(entry, state)
+```bash
+python3 inference/summarize_metrics.py \
+  --dataset_dir output/alibaba/tongyi-deepresearch-30b-a3b/bc-zn10 \
+  --strict
 ```
 
-## 核心输入/输出
+## 重要注意事项
 
-- **输入**：`SearchRequest`（含 query_list、tool_name、search_engine）
-- **输出**：`PreSearchDecision`（含 QueryBlock 列表，每块有 action）
-
-## 决策动作 (SearchAction)
-
-| 动作 | 触发条件 |
-|------|---------|
-| `EXECUTE` | 正常执行 |
-| `MERGE` | turn 内query间相似度 ≥ 0.90 |
-| `REUSE_CACHE` | turn 之间query缓存相似度 ≥ 0.90 |
-| `REDUCE_TOPK` | 高预算压力 |
-
-## 配置重点
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `high_similarity` | 0.90 | 缓存复用/查询合并阈值 |
-| `search_call_budget` | 10 | 最大搜索调用次数 |
-| `observation_token_budget` | 8000 | 最大 token 数 |
-
-**注意**：`embed_fn` 必须设置，这里是调用 embedding_client。
-
-## 注意
-
-- `post_search`  目前为 pass-through 实现，即没有激活
+- Python 建议使用 `3.10.0`。
+- `.env` 已被 gitignore，不能提交真实 key。
+- `MAX_LLM_CALL_PER_RUN` 默认 `100`，单题超时逻辑按 1800s 处理。
+- `PROMPT_NEW=True` 时使用 `inference/prompt_new.py`，否则使用 `inference/prompt.py`。
+- `data/`、`output/`、`cache/`、`Agent/`、`models/` 等目录通常不进入版本控制。

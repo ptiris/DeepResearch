@@ -165,3 +165,7 @@ Agent/
 
 # design document for agent usage
 design.md
+
+
+# opencode config 
+.opencode/
