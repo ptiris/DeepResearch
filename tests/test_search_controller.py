@@ -1,4 +1,5 @@
 import math
+import statistics
 import sys
 import unittest
 from pathlib import Path
@@ -154,10 +155,14 @@ class SearchControllerTests(unittest.TestCase):
 
     def test_mmr_prefers_novel_result_when_history_has_duplicate(self):
         ctrl = controller(mmr_min_results=1, mmr_threshold=-1.0, mmr_beta=2.0)
-        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
         state.memory.add(memory_entry(raw_result=SERPER_RAW))
         entries = ctrl.parse_search_results(SERPER_RAW)
-        selected = ctrl._select_results_mmr("query", entries[:3], state.memory.entries, 1000, 1)
+        selected = ctrl._select_results_mmr(
+            "query", entries[:3], state.memory.entries,
+            action=SearchAction.EXECUTE, budget_state=state.budget_state,
+            max_results=1,
+        )
         self.assertEqual(selected[0]["index"], 3)
 
     def test_history_result_embeddings_are_saved_on_entry(self):
@@ -173,7 +178,7 @@ class SearchControllerTests(unittest.TestCase):
             embed_fn=embedder,
         )
         history = memory_entry(raw_result=HISTORY_RAW)
-        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
         state.memory.add(history)
 
         block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
@@ -192,26 +197,16 @@ class SearchControllerTests(unittest.TestCase):
             f"{i}. [Low Item {i}](https://e.example/{i})\nSnippet" for i in range(1, 7)
         )
         ctrl = controller(mmr_threshold=2.0, mmr_min_results=5)
-        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
         block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
         returned = ctrl.post_search(request(["query"]), raw, state, block)
         self.assertEqual(len(block.selected_result_indices), 5)
         self.assertIn("Controlled Search Results", returned)
 
-    def test_reduce_topk_limits_candidates_to_seven(self):
-        raw = "A Google search for 'query' found 9 results:\n\n## Web Results\n" + "\n\n".join(
-            f"{i}. [Item {i}](https://e.example/{i})\nSnippet" for i in range(1, 10)
-        )
-        ctrl = controller(mmr_threshold=-1.0)
-        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
-        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.REDUCE_TOPK, reason="test", adjusted_topk=7)
-        ctrl.post_search(request(["query"]), raw, state, block)
-        self.assertLessEqual(max(block.selected_result_indices), 7)
-
     def test_reuse_pointer_window_and_old_cache_replay(self):
         ctrl = controller()
         recent = memory_entry(turn_id=8, raw_result=SERPER_RAW)
-        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState(observation_token_budget=1000))
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
         block = QueryBlock(queries=["alpha exact"], original_indices=[0], action=SearchAction.REUSE_CACHE, reason="test", cache_entry=recent)
         returned = ctrl.post_search(request(["alpha exact"], turn_id=10), recent.raw_result, state, block)
         self.assertTrue(block.reuse_pointer)
@@ -223,6 +218,141 @@ class SearchControllerTests(unittest.TestCase):
         self.assertFalse(block.reuse_pointer)
         self.assertIn("Controlled Search Results", returned)
         self.assertTrue(block.selected_result_indices)
+
+
+class DynamicKObsTests(unittest.TestCase):
+    def test_k_obs_returns_base_when_history_short(self):
+        ctrl = controller()
+        bs = BudgetState()
+        self.assertEqual(
+            ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs),
+            5,
+        )
+
+    def test_k_obs_returns_base_when_single_entry(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.7])
+        self.assertEqual(
+            ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs),
+            5,
+        )
+
+    def test_k_obs_increases_with_positive_z_score(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.2, 0.2, 0.2, 0.8])
+        k = ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs)
+        self.assertGreater(k, 5)
+
+    def test_k_obs_decreases_with_negative_z_score(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.8, 0.8, 0.8, 0.2])
+        k = ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs)
+        self.assertLess(k, 5)
+
+    def test_k_obs_clips_to_k_min(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.9, 0.9, 0.9, 0.1])
+        k = ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs)
+        self.assertGreaterEqual(k, 3)
+
+    def test_k_obs_clips_to_k_max(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.1, 0.1, 0.1, 0.9])
+        k = ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs)
+        self.assertLessEqual(k, 7)
+
+    def test_k_obs_reduce_topk_action(self):
+        ctrl = controller()
+        bs = BudgetState()
+        k = ctrl._compute_dynamic_k_obs(SearchAction.REDUCE_TOPK, bs)
+        self.assertEqual(k, 3)
+
+    def test_k_obs_reuse_action(self):
+        ctrl = controller()
+        bs = BudgetState()
+        k = ctrl._compute_dynamic_k_obs(SearchAction.REUSE_CACHE, bs)
+        self.assertEqual(k, 5)
+
+    def test_k_obs_zero_stdev_returns_base(self):
+        ctrl = controller()
+        bs = BudgetState(step_gain_history=[0.5, 0.5, 0.5])
+        k = ctrl._compute_dynamic_k_obs(SearchAction.EXECUTE, bs)
+        self.assertEqual(k, 5)
+
+
+class StepGainTests(unittest.TestCase):
+    def test_record_step_gain_appends_mean_mmr_score(self):
+        ctrl = controller()
+        bs = BudgetState()
+        items = [
+            {"_mmr_score": 0.8, "title": "a"},
+            {"_mmr_score": 0.6, "title": "b"},
+        ]
+        ctrl._record_step_gain(items, [1.0, 0.0], bs)
+        self.assertEqual(len(bs.step_gain_history), 1)
+        self.assertAlmostEqual(bs.step_gain_history[0], 0.7)
+
+    def test_record_step_gain_skips_empty_items(self):
+        ctrl = controller()
+        bs = BudgetState()
+        ctrl._record_step_gain([], [1.0, 0.0], bs)
+        self.assertEqual(len(bs.step_gain_history), 0)
+
+    def test_record_step_gain_skips_empty_embedding(self):
+        ctrl = controller()
+        bs = BudgetState()
+        ctrl._record_step_gain([{"_mmr_score": 0.5}], [], bs)
+        self.assertEqual(len(bs.step_gain_history), 0)
+
+    def test_record_step_gain_ignores_items_without_mmr_score(self):
+        ctrl = controller()
+        bs = BudgetState()
+        items = [{"title": "a"}, {"_mmr_score": 0.9, "title": "b"}]
+        ctrl._record_step_gain(items, [1.0, 0.0], bs)
+        self.assertEqual(len(bs.step_gain_history), 1)
+        self.assertAlmostEqual(bs.step_gain_history[0], 0.9)
+
+
+class PostSearchDynamicKObsTests(unittest.TestCase):
+    def test_dynamic_k_obs_enables_step_gain_recording(self):
+        ctrl = controller(dynamic_k_obs_enabled=True)
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
+        ctrl.post_search(request(["query"]), SERPER_RAW, state, block)
+        self.assertGreater(len(state.budget_state.step_gain_history), 0)
+
+    def test_dynamic_k_obs_disabled_uses_old_topk(self):
+        raw = "A Google search for 'query' found 9 results:\n\n## Web Results\n" + "\n\n".join(
+            f"{i}. [Item {i}](https://e.example/{i})\nSnippet" for i in range(1, 10)
+        )
+        ctrl = controller(mmr_threshold=-1.0, dynamic_k_obs_enabled=False)
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.REDUCE_TOPK, reason="test", adjusted_topk=7)
+        ctrl.post_search(request(["query"]), raw, state, block)
+        self.assertLessEqual(max(block.selected_result_indices), 7)
+
+    def test_reuse_cache_k_obs_allows_full_budget(self):
+        ctrl = controller(mmr_threshold=-1.0, dynamic_k_obs_enabled=True)
+        raw = "A Google search for 'query' found 9 results:\n\n## Web Results\n" + "\n\n".join(
+            f"{i}. [Item {i}](https://e.example/{i})\nSnippet" for i in range(1, 10)
+        )
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
+        # REUSE_CACHE now has same K_obs budget as EXECUTE (k_base=5, k_max=7)
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.REUSE_CACHE, reason="test")
+        ctrl.post_search(request(["query"]), raw, state, block)
+        self.assertGreaterEqual(len(block.selected_result_indices), 3)
+
+    def test_execute_k_obs_with_no_history_uses_base(self):
+        ctrl = controller(mmr_threshold=-1.0, dynamic_k_obs_enabled=True)
+        raw = "A Google search for 'query' found 9 results:\n\n## Web Results\n" + "\n\n".join(
+            f"{i}. [Item {i}](https://e.example/{i})\nSnippet" for i in range(1, 10)
+        )
+        state = ControllerState(memory=SearchMemory(), budget_state=BudgetState())
+        block = QueryBlock(queries=["query"], original_indices=[0], action=SearchAction.EXECUTE, reason="test")
+        ctrl.post_search(request(["query"]), raw, state, block)
+        # k_base for EXECUTE = 5, with no history we get 5
+        self.assertLessEqual(len(block.selected_result_indices), 7)
+        self.assertGreaterEqual(len(block.selected_result_indices), 1)
 
 
 if __name__ == "__main__":

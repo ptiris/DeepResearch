@@ -4,6 +4,7 @@ import datetime
 import json
 import math
 import os
+import statistics
 import re
 import threading
 from dataclasses import dataclass, field
@@ -142,28 +143,26 @@ class ContextProfile:
 @dataclass
 class BudgetState:
     """Tracks search budget consumption and pressure level.
-    
+
     Attributes
     ----------
     effective_search_calls : int
         Number of search calls executed.
     search_call_budget : int
         Maximum allowed search calls.
-    observation_tokens_used : int
-        Tokens consumed by observations.
-    observation_token_budget : int
-        Maximum observation tokens allowed.
     current_turn : int
         Current conversation turn.
     max_turns : int
         Maximum conversation turns allowed.
+    step_gain_history : list[float]
+        Mean MMR scores of selected results per search step, used for
+        dynamic K_obs z-score computation.
     """
     effective_search_calls: int = 0
     search_call_budget: int = 10
-    observation_tokens_used: int = 0
-    observation_token_budget: int = 8000
     current_turn: int = 0
     max_turns: int = 10
+    step_gain_history: list[float] = field(default_factory=list)
 
     @property
     def pressure(self) -> float:
@@ -176,7 +175,6 @@ class BudgetState:
         """
         return max(
             self.effective_search_calls / max(self.search_call_budget, 1),
-            self.observation_tokens_used / max(self.observation_token_budget, 1),
             self.current_turn / max(self.max_turns, 1),
         )
 
@@ -473,23 +471,34 @@ class SearchController:
     - Which queries to execute vs. reuse from cache
     - Which queries to merge together
     - How many results to retrieve based on budget pressure
+
+    Uses dynamic observation budget (K_obs) based on z-score of step-level
+    marginal gain to control how many search results are selected per step.
     
     Parameters
     ----------
     params : dict or None
-        Configuration parameters for thresholds and cost estimates.
+        Configuration parameters for thresholds.
         - high_similarity: Threshold for cache reuse (default 0.90)
-        - medium_similarity: Threshold for merge detection (default 0.75)
+        - medium_similarity: Threshold for merge detection (default 0.70)
         - pointer_turn_distance: Max turns to look back for cache (default 3)
-        - cost_per_search: Estimated cost per search call (default 0.01)
-        - cost_per_obs_token: Cost per observation token (default 0.00001)
-        - default_topk: Default number of results (default 10)
+        - dynamic_k_obs_enabled: Enable dynamic K_obs budget (default True)
     embed_fn : callable or None
         Callable[[str], list[float]] for query embedding. If None,
         similarity computation is skipped.
     context_profile : ContextProfile or None
         ContextProfile for admission and replay policies.
     """
+
+    # Dynamic observation budget table from design.md Section 5
+    K_OBS_TABLE = {
+        SearchAction.EXECUTE: {"k_min": 3, "k_base": 5, "k_max": 7, "k_extra": 1},
+        SearchAction.REDUCE_TOPK: {"k_min": 1, "k_base": 3, "k_max": 5, "k_extra": 1},
+        SearchAction.REUSE_CACHE: {"k_min": 3, "k_base": 5, "k_max": 7, "k_extra": 1},
+        SearchAction.MERGE: {"k_min": 3, "k_base": 5, "k_max": 7, "k_extra": 1},
+        SearchAction.SKIP_DUPLICATE: {"k_min": 1, "k_base": 1, "k_max": 2, "k_extra": 1},
+        SearchAction.REWRITE_REQUEST: {"k_min": 3, "k_base": 5, "k_max": 7, "k_extra": 1},
+    }
     
     def __init__(
         self,
@@ -516,18 +525,15 @@ class SearchController:
         self.pointer_turn_dist = self.params.get("pointer_turn_distance", _env_int("SEARCH_CONTROLLER_REUSE_POINTER_WINDOW", 3))
         self.reduce_topk = self.params.get("reduce_topk", _env_int("SEARCH_CONTROLLER_REDUCE_TOPK", 7))
 
-        self.cost_per_search = self.params.get("cost_per_search", 0.01)
-        self.cost_per_obs_token = self.params.get("cost_per_obs_token", 0.00001)
-        self.estimated_obs_tokens = self.params.get("estimated_obs_tokens", 800)
-        self.estimated_replay_factor = self.params.get("estimated_replay_factor", _env_float("SEARCH_MMR_REPLAY_FACTOR", 3.0))
+        self.dynamic_k_obs_enabled = self.params.get(
+            "dynamic_k_obs_enabled",
+            os.getenv("SEARCH_DYNAMIC_K_OBS", "true").lower() == "true",
+        )
+
         self.mmr_alpha = self.params.get("mmr_alpha", _env_float("SEARCH_MMR_ALPHA", 0.35))
         self.mmr_beta = self.params.get("mmr_beta", _env_float("SEARCH_MMR_BETA", 0))
-        self.mmr_gamma = self.params.get("mmr_gamma", _env_float("SEARCH_MMR_GAMMA", 0))
         self.mmr_threshold = self.params.get("mmr_threshold", _env_float("SEARCH_MMR_THRESHOLD", 0.05))
         self.mmr_min_results = self.params.get("mmr_min_results", _env_int("SEARCH_MMR_MIN_RESULTS", 5))
-        self.latency_cost_coeff = self.params.get("latency_cost_coeff", 0.001)
-        self.estimated_latency_ms = self.params.get("estimated_latency_ms", 500.0)
-        self.cost_weight = self.params.get("cost_weight", 1.0)
 
         # Section 10.1: pre-search utility weights
         self.w_new_query = self.params.get("w_new_query", 1.0)
@@ -666,6 +672,71 @@ class SearchController:
             turn_id=request.turn_id,
             query_blocks=blocks,
         )
+    
+
+    def _compute_dynamic_k_obs(
+        self,
+        action: SearchAction,
+        budget_state: BudgetState,
+    ) -> int:
+        """Compute dynamic K_obs based on z-score of step gain history.
+
+        K_obs(t) = clip(K_base + round(K_extra * z_t), K_min, K_max)
+
+        When fewer than 2 history entries exist, returns K_base.
+
+        Parameters
+        ----------
+        action : SearchAction
+            The action for the current query block.
+        budget_state : BudgetState
+            Current budget state containing step_gain_history.
+
+        Returns
+        -------
+        int
+            Dynamic K_obs value clipped to [K_min, K_max].
+        """
+        table = self.K_OBS_TABLE.get(action, self.K_OBS_TABLE[SearchAction.EXECUTE])
+        history = budget_state.step_gain_history
+        if len(history) < 2:
+            return table["k_base"]
+        mu = statistics.mean(history)
+        sigma = statistics.stdev(history)
+        if sigma == 0:
+            return table["k_base"]
+        z_t = (history[-1] - mu) / sigma
+        k_obs = table["k_base"] + round(table["k_extra"] * z_t)
+        return max(table["k_min"], min(k_obs, table["k_max"]))
+
+    def _record_step_gain(
+        self,
+        selected_items: list[dict],
+        query_emb: list[float],
+        budget_state: BudgetState,
+    ) -> None:
+        """Record the mean MMR score of selected results as step gain.
+
+        G_t = (1/L) * sum(MG(r_i)) for each selected result, where MG is
+        the MMR score at selection time. Appends G_t to step_gain_history.
+
+        Parameters
+        ----------
+        selected_items : list[dict]
+            Selected result items from MMR, each with '_mmr_score' key.
+        query_emb : list[float]
+            Query embedding vector.
+        budget_state : BudgetState
+            Budget state to update step_gain_history.
+        """
+        if not selected_items or not query_emb:
+            return
+        scores = [
+            item["_mmr_score"] for item in selected_items
+            if "_mmr_score" in item
+        ]
+        if scores:
+            budget_state.step_gain_history.append(statistics.mean(scores))
 
 
     def _embed_queries(self, query_list: list[str]) -> list[list[float]]:
@@ -692,13 +763,13 @@ class SearchController:
         """Compute pairwise cosine similarity matrix between query embeddings.
         
         Parameters
-    ----------
-    embeddings : list[list[float]]
-        List of query embedding vectors.
+        ----------
+        embeddings : list[list[float]]
+            List of query embedding vectors.
 
-    Returns
-    -------
-    list[list[float]]
+        Returns
+        -------
+        list[list[float]]
         NxN similarity matrix where sim[i][j] = similarity between i and j.
         """
         n = len(embeddings)
@@ -731,24 +802,6 @@ class SearchController:
             return None, 0.0
         return cache_hits[0]
 
-
-    def _estimate_pre_cost(self) -> float:
-        """Estimate pre-search cost.
-
-        Returns
-        -------
-        float
-            Estimated cost in arbitrary units for executing a single query.
-
-        Formula: C_pre = p_search + n_obs*p_in + r_replay*n_obs*p_in + mu*t_search
-        """
-        n_obs = self.estimated_obs_tokens
-        return (
-            self.cost_per_search
-            + n_obs * self.cost_per_obs_token
-            + self.estimated_replay_factor * n_obs * self.cost_per_obs_token
-            + self.latency_cost_coeff * self.estimated_latency_ms
-        )
 
     def _decide_single_query(
         self,
@@ -905,10 +958,9 @@ class SearchController:
             return source_raw
 
         candidate_entries = entries
-        if block.action == SearchAction.REDUCE_TOPK:
-            candidate_entries = entries[: max(1, block.adjusted_topk or self.reduce_topk)]
-        elif block.action == SearchAction.REUSE_CACHE:
-            candidate_entries = entries[:5]
+        if not self.dynamic_k_obs_enabled:
+            if block.action == SearchAction.REDUCE_TOPK:
+                candidate_entries = entries[: max(1, block.adjusted_topk or self.reduce_topk)]
 
         query = block.merged_query or (block.queries[0] if block.queries else "")
         if not block.query_embedding and query:
@@ -917,13 +969,17 @@ class SearchController:
             query=query,
             candidates=candidate_entries,
             history_entries=state.memory.entries,
-            token_budget=max(1, state.budget_state.observation_token_budget),
+            action=block.action,
+            budget_state=state.budget_state,
             max_results=len(candidate_entries),
             query_emb=block.query_embedding,
         )
         if not selected:
             selected = candidate_entries[: min(len(candidate_entries), self.mmr_min_results)]
             self._attach_result_embeddings(selected)
+
+        if self.dynamic_k_obs_enabled:
+            self._record_step_gain(selected, block.query_embedding, state.budget_state)
 
         returned = self._format_selected_observation(source_raw, selected)
         block.raw_result = source_raw
@@ -968,7 +1024,8 @@ class SearchController:
         query: str,
         candidates: list[dict],
         history_entries: list[SearchMemoryEntry],
-        token_budget: int,
+        action: SearchAction,
+        budget_state: BudgetState,
         max_results: int,
         query_emb: list[float] | None = None,
     ) -> list[dict]:
@@ -980,23 +1037,29 @@ class SearchController:
         for item, emb in zip(candidates, candidate_embs):
             item["_similarity_embedding"] = emb
         history_embs = self._selected_history_result_embeddings(history_entries)
-        token_lengths = [self._count_tokens(item["text"]) for item in candidates]
+
+        # Compute initial K_obs from action table
+        k_obs_table = self.K_OBS_TABLE.get(action, self.K_OBS_TABLE[SearchAction.EXECUTE])
+        initial_k_obs = self._compute_dynamic_k_obs(action, budget_state)
 
         selected_positions: list[int] = []
+        selected_scores: list[float] = []
         remaining = set(range(len(candidates)))
-        used_tokens = 0
         max_results = max(1, min(max_results, len(candidates)))
 
-        # --- MMR statistics header ---
+        # TODO: AQ admission quality filtering will be added here
+        # For now, candidates go directly to MMR selection
+
         print(f"\n{'='*80}")
         print(f"[MMR] Query: {query[:100]}{'...' if len(query) > 100 else ''}")
         print(f"[MMR] Candidates: {len(candidates)} | History ents: {len(history_embs)} | Max slots: {max_results}")
-        print(f"[MMR] Params: alpha={self.mmr_alpha} beta={self.mmr_beta} gamma={self.mmr_gamma} "
-              f"threshold={self.mmr_threshold} min_results={self.mmr_min_results} budget={token_budget}")
-        print(f"[MMR] Tokens per candidate: {token_lengths}")
+        print(f"[MMR] Action: {action.value} | K_obs table: {k_obs_table} | Initial K_obs: {initial_k_obs}")
+        print(f"[MMR] Params: alpha={self.mmr_alpha} beta={self.mmr_beta} "
+              f"threshold={self.mmr_threshold} min_results={self.mmr_min_results}")
+        print(f"[MMR] Step gain history: {budget_state.step_gain_history}")
 
-        n_skipped_budget = 0
         n_stopped_threshold = 0
+        n_stopped_k_obs = 0
         round_num = 0
         mmr_rounds: list[dict] = []
 
@@ -1007,7 +1070,6 @@ class SearchController:
             best_rel = 0.0
             best_red_cur = 0.0
             best_red_hist = 0.0
-            best_cost = 0.0
             round_candidates: list[dict] = []
 
             for pos in remaining:
@@ -1021,15 +1083,13 @@ class SearchController:
                 red_hist = 0.0
                 if history_embs:
                     red_hist = max(_cosine_similarity(candidate_embs[pos], hist_emb) for hist_emb in history_embs)
-                raw_cost = token_lengths[pos] * (1.0 + self.estimated_replay_factor)
-                cost = min(1.0, raw_cost / max(float(token_budget), 1.0))
-                score = rel - self.mmr_alpha * red_cur - self.mmr_beta * red_hist - self.mmr_gamma * cost
+                score = rel - self.mmr_alpha * red_cur - self.mmr_beta * red_hist
 
                 title = candidates[pos].get("title", "")[:80]
                 round_candidates.append({
                     "idx": pos, "score": round(score, 6), "rel": round(rel, 6),
                     "red_cur": round(red_cur, 6), "red_hist": round(red_hist, 6),
-                    "cost": round(cost, 6), "tokens": token_lengths[pos], "title": title,
+                    "title": title,
                 })
 
                 if score > best_score:
@@ -1038,19 +1098,17 @@ class SearchController:
                     best_rel = rel
                     best_red_cur = red_cur
                     best_red_hist = red_hist
-                    best_cost = cost
 
             if best_pos is None:
                 break
 
-            # Log all candidate scores for this round (sorted by score descending)
             round_candidates.sort(key=lambda x: x["score"], reverse=True)
             print(f"\n[MMR] --- Round {round_num} ---")
             for rc in round_candidates:
                 marker = " >> SELECTED <<" if rc["idx"] == best_pos else ""
                 print(f"[MMR]   #{rc['idx']:2d} score={rc['score']:+.4f} rel={rc['rel']:.4f} "
                       f"red_cur={rc['red_cur']:.4f} red_hist={rc['red_hist']:.4f} "
-                      f"cost={rc['cost']:.4f} | {rc['title']}{marker}")
+                      f"| {rc['title']}{marker}")
 
             mmr_rounds.append({
                 "round": round_num,
@@ -1059,7 +1117,6 @@ class SearchController:
                 "best_rel": round(best_rel, 6),
                 "best_red_cur": round(best_red_cur, 6),
                 "best_red_hist": round(best_red_hist, 6),
-                "best_cost": round(best_cost, 6),
                 "candidates": round_candidates,
             })
 
@@ -1069,35 +1126,57 @@ class SearchController:
                 n_stopped_threshold += 1
                 break
 
-            if used_tokens + token_lengths[best_pos] > token_budget:
-                n_skipped_budget += 1
-                print(f"[MMR] SKIP #{best_pos}: tokens {used_tokens + token_lengths[best_pos]} > budget {token_budget}")
-                remaining.remove(best_pos)
-                continue
+            # Store MMR score on the candidate for step gain recording
+            candidates[best_pos]["_mmr_score"] = best_score
 
             selected_positions.append(best_pos)
-            used_tokens += token_lengths[best_pos]
+            selected_scores.append(best_score)
             remaining.remove(best_pos)
+
+            # Recompute dynamic K_obs from running G_t and step_gain_history
+            running_g_t = statistics.mean(selected_scores)
+            history = budget_state.step_gain_history
+            if len(history) >= 2:
+                mu = statistics.mean(history)
+                sigma = statistics.stdev(history)
+                if sigma > 0:
+                    z_t = (running_g_t - mu) / sigma
+                    current_k_obs = max(k_obs_table["k_min"],
+                                        min(k_obs_table["k_base"] + round(k_obs_table["k_extra"] * z_t),
+                                            k_obs_table["k_max"]))
+                else:
+                    current_k_obs = k_obs_table["k_base"]
+            else:
+                current_k_obs = k_obs_table["k_base"]
+
+            print(f"[MMR]   G_t={running_g_t:.4f} z_t={((running_g_t - statistics.mean(history)) / statistics.stdev(history)) if len(history) >= 2 and statistics.stdev(history) > 0 else 'N/A'} "
+                  f"K_obs={current_k_obs} selected={len(selected_positions)}")
+
+            if len(selected_positions) >= current_k_obs:
+                print(f"[MMR] STOP: selected {len(selected_positions)} >= dynamic K_obs={current_k_obs}")
+                n_stopped_k_obs += 1
+                break
 
         # --- MMR statistics summary ---
         selected_rel_range: tuple[float, float] = (0.0, 0.0)
         selected_rel_avg = 0.0
         if selected_positions:
-            selected_scores = []
+            scores = []
             for pos in selected_positions:
                 rel = _cosine_similarity(candidate_embs[pos], query_emb)
-                selected_scores.append(rel)
-            selected_rel_range = (round(min(selected_scores), 6), round(max(selected_scores), 6))
-            selected_rel_avg = round(sum(selected_scores) / len(selected_scores), 6)
+                scores.append(rel)
+            selected_rel_range = (round(min(scores), 6), round(max(scores), 6))
+            selected_rel_avg = round(sum(scores) / len(scores), 6)
 
         print(f"\n[MMR] ===== Summary =====")
         print(f"[MMR] Selected: {len(selected_positions)}/{len(candidates)} candidates "
-              f"in {round_num} rounds | Tokens used: {used_tokens}/{token_budget}")
-        print(f"[MMR] Skipped (budget): {n_skipped_budget} | Stopped (threshold): {n_stopped_threshold} "
+              f"in {round_num} rounds")
+        print(f"[MMR] Stopped (threshold): {n_stopped_threshold} | Stopped (K_obs): {n_stopped_k_obs} "
               f"| Remaining: {len(remaining)}")
         if selected_positions:
             print(f"[MMR] Selected relevance range: [{selected_rel_range[0]:.4f}, {selected_rel_range[1]:.4f}] "
                   f"avg={selected_rel_avg:.4f}")
+        print(f"[MMR] Step gain history before update: {budget_state.step_gain_history}")
         print(f"{'='*80}\n")
 
         # --- Write structured MMR stats to file ---
@@ -1108,24 +1187,23 @@ class SearchController:
                 "num_candidates": len(candidates),
                 "num_history_embeddings": len(history_embs),
                 "max_slots": max_results,
+                "k_obs_table": k_obs_table,
+                "initial_k_obs": initial_k_obs,
                 "params": {
                     "alpha": self.mmr_alpha,
                     "beta": self.mmr_beta,
-                    "gamma": self.mmr_gamma,
                     "threshold": self.mmr_threshold,
                     "min_results": self.mmr_min_results,
-                    "token_budget": token_budget,
                 },
-                "token_lengths": token_lengths,
+                "step_gain_history": budget_state.step_gain_history,
                 "rounds": mmr_rounds,
                 "summary": {
                     "selected_count": len(selected_positions),
                     "total_candidates": len(candidates),
-                    "skipped_budget": n_skipped_budget,
                     "stopped_threshold": n_stopped_threshold,
+                    "stopped_k_obs": n_stopped_k_obs,
                     "remaining": len(remaining),
                     "total_rounds": round_num,
-                    "tokens_used": used_tokens,
                     "selected_relevance_range": selected_rel_range,
                     "selected_relevance_avg": selected_rel_avg,
                 },
@@ -1224,6 +1302,5 @@ class SearchController:
         """
         if entry.executed_external_api and entry.tool_status == ToolStatus.SUCCESS_NONEMPTY:
             state.budget_state.effective_search_calls += 1
-            state.budget_state.observation_tokens_used += entry.returned_observation_tokens
 
         state.memory.add(entry)

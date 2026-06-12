@@ -37,7 +37,7 @@ python evaluation/evaluate_all_official.py --input_fp <dir> --dataset <name>
 
 - `inference/react_agent.py` — Core `MultiTurnReactAgent` class with ReAct tool-calling loop
 - `inference/model_client.py` — Multi-provider routing (openrouter/dashscope/openai) with per-stage config (`ModelClient`)
-- `inference/search_controller.py` — `SearchController` for query deduplication, caching, merging, and budget management
+- `inference/search_controller.py` — `SearchController` for query deduplication, caching, merging, and dynamic K_obs observation budget management
 - `inference/prompt.py` / `inference/prompt_new.py` — Two prompt variants; toggled by `PROMPT_NEW=True` env var
 - `inference/run_multi_react.py` — Multi-worker inference orchestration with parallel rollout support
 - `inference/run_react_infer.sh` — Entry point; sources `.env` → runs `run_multi_react.py`
@@ -100,6 +100,7 @@ For file processing: prepend filename to question, place files in `eval_data/fil
 - `DISABLE_SEARCH_CONTROLLER` — Set `true` to bypass SearchController
 - `PROMPT_NEW` — Set `True` to use `prompt_new.py` instead of `prompt.py`
 - `REDUNDANCY_ENABLED`, `REDUNDANCY_STRATEGY`, `REDUNDANCY_SCOPE`, `REDUNDANCY_SIMILARITY_THRESHOLD` — Query deduplication
+- `SEARCH_DYNAMIC_K_OBS` — Set `true` (default) to enable dynamic K_obs observation budget; `false` uses static topk
 
 ## Important Notes
 

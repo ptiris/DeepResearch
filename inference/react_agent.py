@@ -104,7 +104,6 @@ class MultiTurnReactAgent(FnCallAgent):
             memory=SearchMemory(),
             budget_state=BudgetState(
                 search_call_budget=10,
-                observation_token_budget=int(os.getenv("OBS_TOKEN_BUDGET", "8000")),
                 max_turns=MAX_LLM_CALL_PER_RUN,
             ),
         )
